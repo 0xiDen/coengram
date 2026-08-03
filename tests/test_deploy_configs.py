@@ -501,9 +501,14 @@ def test_release_publication_order_and_dependency_update_scope_are_safe() -> Non
     ci = read(ROOT / ".github" / "workflows" / "ci.yml")
     release = read(ROOT / ".github" / "workflows" / "release.yml")
     dependabot = read(ROOT / ".github" / "dependabot.yml")
+    upload_artifact_v7 = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1"
 
     assert 'echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"' in ci
     assert '"/usr/lib/postgresql/17/bin/pg_dump" --version' in ci
+    assert upload_artifact_v7 in ci
+    assert upload_artifact_v7 in release
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" not in ci
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" not in release
     assert re.search(
         r"^  publish-pypi:\n(?:.*\n)*?    needs: \[build-python, publish-container\]$",
         release,
