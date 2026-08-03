@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "schedule_utc": "15 01 * * *",
+  "rpo_hours": 24,
+  "rto_hours": 4,
+  "retention": {
+    "daily": 7,
+    "weekly": 4
+  },
+  "encryption": {
+    "scheme": "age-x25519",
+    "recipient_file": "/run/secrets/memory-backup-age-recipients",
+    "identity_file": "/run/secrets/memory-backup-age-identity",
+    "required_file_mode": "0600"
+  },
+  "restore": {
+    "isolated_target_prefix": "memory-restore-drill-",
+    "active_route_allowed": false,
+    "quarterly_drill_required": true
+  }
+}

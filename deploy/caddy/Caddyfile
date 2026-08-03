@@ -1,0 +1,34 @@
+{
+	admin off
+
+	log {
+		output stdout
+		format filter {
+			identifier delete
+			identifiers delete
+			domain delete
+			domains delete
+			host delete
+			server_name delete
+			subjects delete
+			wrap json
+		}
+	}
+
+	metrics
+}
+
+import "/etc/caddy/gateway-routes.caddy"
+
+http://:9180 {
+	metrics /metrics
+}
+
+{$MEMORY_PUBLIC_HOST} {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+
+	import memory_access_log
+	import memory_gateway_routes
+}

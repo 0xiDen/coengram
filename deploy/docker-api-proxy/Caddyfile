@@ -1,0 +1,21 @@
+{
+	admin off
+	auto_https off
+}
+
+:2375 {
+	@alloy_docker_reads {
+		method GET HEAD
+		path_regexp docker_read "^/(?:v[0-9]+\.[0-9]+/)?(?:_ping|version|containers/json|networks|containers/[0-9a-f]{64}/(?:json|logs))$"
+	}
+
+	handle @alloy_docker_reads {
+		reverse_proxy unix//var/run/docker.sock {
+			header_up Host localhost
+		}
+	}
+
+	handle {
+		respond 403
+	}
+}

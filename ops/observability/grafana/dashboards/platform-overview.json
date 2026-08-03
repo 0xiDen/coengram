@@ -1,0 +1,306 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "description": "Public request throughput observed by Caddy.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(caddy_http_request_duration_seconds_count[5m]))",
+          "legendFormat": "requests",
+          "refId": "A"
+        }
+      ],
+      "title": "Ingress request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "description": "Informational signals only; iteration 1 never returns 429 for these limits.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (limit_kind) (rate(memory_shadow_would_limit_total[5m]))",
+          "legendFormat": "{{limit_kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Shadow-limit signals",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "mimir"
+      },
+      "description": "Ready messages by durable RabbitMQ queue.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (queue) (rabbitmq_queue_messages_ready)",
+          "legendFormat": "{{queue}}",
+          "refId": "A"
+        }
+      ],
+      "title": "RabbitMQ queue depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Authenticated requests grouped only by hashed Tenant reference.",
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 4,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {
+          "expr": "sum by (tenant) (rate(memory_authenticated_requests_total[5m]))",
+          "legendFormat": "{{tenant}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Authenticated request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Current embedding/search and synthesis work; thresholds remain informational.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 5,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {
+          "expr": "sum by (operation) (memory_concurrent_operations)",
+          "legendFormat": "{{operation}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Concurrent memory and Agent work",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "Content-free worker retry and dependency failures.",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 6,
+      "options": {"showLabels": false, "showTime": true, "sortOrder": "Descending"},
+      "targets": [
+        {
+          "expr": "{service_name=~\".*worker.*\"} | json | event=~\".*failed|.*retry.*\"",
+          "refId": "A"
+        }
+      ],
+      "title": "Worker failures and retries",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "Opaque Agent Run references and terminal/progress states; no prompts or outputs.",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+      "id": 7,
+      "options": {"showLabels": false, "showTime": true, "sortOrder": "Descending"},
+      "targets": [
+        {
+          "expr": "{service_name=~\".*worker.*\"} |= \"agent_run.progressed\"",
+          "refId": "A"
+        }
+      ],
+      "title": "Agent Run progress",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "Shared PostgreSQL operational logs collected from the labelled container.",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+      "id": 8,
+      "options": {"showLabels": false, "showTime": true, "sortOrder": "Descending"},
+      "targets": [
+        {"expr": "{service_name=~\".*postgres.*\"}", "refId": "A"}
+      ],
+      "title": "PostgreSQL operations",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "loki", "uid": "loki"},
+      "description": "Tenant Neo4j Community health and failure logs, keyed by opaque Tenant label.",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+      "id": 9,
+      "options": {"showLabels": true, "showTime": true, "sortOrder": "Descending"},
+      "targets": [
+        {"expr": "{service_name=~\".*neo4j.*\"}", "refId": "A"}
+      ],
+      "title": "Tenant Neo4j operations",
+      "type": "logs"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Authentication outcomes and average verifier latency; credentials and identities are never labels.",
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "id": 10,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(memory_authentication_total[5m]))", "legendFormat": "{{outcome}}", "refId": "A"},
+        {"expr": "sum(rate(memory_authentication_duration_seconds_sum[5m])) / clamp_min(sum(rate(memory_authentication_duration_seconds_count[5m])), 1)", "legendFormat": "average latency", "refId": "B"}
+      ],
+      "title": "Authentication outcomes and latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Application dependency gauges, PostgreSQL exporter health, and Community-compatible Neo4j Bolt probes.",
+      "fieldConfig": {"defaults": {"min": 0, "max": 1}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "id": 11,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "memory_dependency_healthy", "legendFormat": "{{dependency}}", "refId": "A"},
+        {"expr": "pg_up", "legendFormat": "PostgreSQL", "refId": "B"},
+        {"expr": "probe_success{tenant_ref=~\"o_.*\"}", "legendFormat": "Neo4j {{tenant_ref}}", "refId": "C"}
+      ],
+      "title": "Route and dependency health",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Terminal Agent outcomes and bounded budget dimensions without prompts or outputs.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "id": 12,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(memory_agent_runs_total[5m]))", "legendFormat": "runs {{outcome}}", "refId": "A"},
+        {"expr": "sum by (dimension) (rate(memory_agent_budget_exhaustions_total[5m]))", "legendFormat": "budget {{dimension}}", "refId": "B"}
+      ],
+      "title": "Agent outcomes and budgets",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Oldest claimed PostgreSQL outbox age plus broker dead-letter depth.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 32},
+      "id": 13,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "max(memory_outbox_oldest_claim_seconds)", "legendFormat": "outbox age seconds", "refId": "A"},
+        {"expr": "sum(rabbitmq_queue_messages_ready{queue=~\".*dead.*\"})", "legendFormat": "DLQ ready", "refId": "B"},
+        {"expr": "sum by (outcome) (rate(memory_outbox_operations_total[5m]))", "legendFormat": "{{outcome}}", "refId": "C"}
+      ],
+      "title": "Outbox lag and dead letters",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Worker cycles and Telegram command classes; message text and external identities are excluded.",
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 32},
+      "id": 14,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "sum by (outcome) (rate(memory_worker_cycles_total[5m]))", "legendFormat": "worker {{outcome}}", "refId": "A"},
+        {"expr": "sum by (outcome, command) (rate(memory_telegram_updates_total[5m]))", "legendFormat": "telegram {{outcome}} {{command}}", "refId": "B"}
+      ],
+      "title": "Worker and Telegram outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "mimir"},
+      "description": "Informational active-token hygiene signals. Iteration 1 does not revoke or throttle automatically.",
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 32},
+      "id": 15,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}},
+      "targets": [
+        {"expr": "memory_unused_access_tokens", "legendFormat": "{{signal}}", "refId": "A"}
+      ],
+      "title": "Unused Access Token signals",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": [
+    "memory-platform"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Memory Platform Overview",
+  "uid": "memory-platform-overview",
+  "version": 1
+}

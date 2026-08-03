@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly encrypted Tenant memory backup for %i
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+RandomizedDelaySec=30m
+Persistent=yes
+Unit=coengram-backup@%i.service
+
+[Install]
+WantedBy=timers.target

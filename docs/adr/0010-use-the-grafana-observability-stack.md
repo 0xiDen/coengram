@@ -1,0 +1,3 @@
+# Use the Grafana observability stack
+
+Iteration 1 self-hosts Grafana Alloy, Mimir, Loki, Tempo, and Grafana as the central observability path for Caddy, memory services, administrative jobs, ActiveGraph, and LangChain. Content-safe components emit structured logs, metrics, and OpenTelemetry traces to Alloy, while Grafana receives provisioned Mimir, Loki, and Tempo data sources so operational correlation is consistent across the whole system. PostgreSQL and Neo4j stdout are deliberately excluded because diagnostics can contain stored values; their health remains visible through a least-privilege PostgreSQL exporter and a Neo4j Bolt probe.

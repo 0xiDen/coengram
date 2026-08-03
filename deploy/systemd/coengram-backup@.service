@@ -1,0 +1,22 @@
+[Unit]
+Description=Encrypted Tenant memory backup and retention for %i
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=oneshot
+User=memory-operator
+Group=memory-operator
+SupplementaryGroups=docker
+WorkingDirectory=/opt/coengram
+EnvironmentFile=/etc/coengram/operator.env
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/coengram
+ExecStart=/usr/local/bin/coengramctl backup create --tenant-id %i
+ExecStart=/usr/local/bin/coengramctl backup status --tenant-id %i
+ExecStart=/usr/local/bin/coengramctl backup retention-plan --tenant-id %i
+ExecStart=/usr/local/bin/coengramctl backup retention-apply --tenant-id %i --confirm %i

@@ -1,0 +1,41 @@
+name: memory-tenant-${TENANT_ID:?Set TENANT_ID to the immutable Tenant identifier}
+
+services:
+  neo4j:
+    image: neo4j:5.26.28-community@sha256:362542416de6c09a971484d1893878016cc3b5cdec166e54b1c824a220ecd6b9
+    restart: "no"
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        export NEO4J_AUTH="neo4j/$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+        exec /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_bolt_advertised__address: neo4j-${TENANT_ID}:7687
+    ports:
+      - 127.0.0.1:${BACKUP_NEO4J_PORT:?Set BACKUP_NEO4J_PORT}:7687
+    secrets:
+      - neo4j_password
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j
+          -p "$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+          'RETURN 1' >/dev/null
+      interval: 2s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+
+secrets:
+  neo4j_password:
+    file: ${TENANT_SECRETS_DIR:?Set TENANT_SECRETS_DIR}/neo4j_password
+
+volumes:
+  neo4j_data:
+    name: memory-tenant-${TENANT_ID}-neo4j-data

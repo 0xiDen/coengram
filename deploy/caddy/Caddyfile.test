@@ -1,0 +1,25 @@
+{
+	admin off
+	auto_https off
+
+	log {
+		output stdout
+		format filter {
+			identifier delete
+			identifiers delete
+			domain delete
+			domains delete
+			host delete
+			server_name delete
+			subjects delete
+			wrap json
+		}
+	}
+}
+
+import /etc/caddy/gateway-routes.caddy
+
+http://:8080 {
+	import memory_access_log
+	import memory_gateway_routes
+}

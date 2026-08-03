@@ -1,0 +1,68 @@
+(memory_access_log) {
+	log {
+		output stdout
+		format filter {
+			request>host delete
+			request>headers>Host delete
+			request>tls>server_name delete
+			wrap json
+		}
+	}
+}
+
+(memory_gateway_proxy) {
+	reverse_proxy gateway:8080 {
+		# Identity and scope are derived from the Bearer token by the gateway.
+		# Never forward caller-selected values that resemble authoritative context.
+		header_up -X-Tenant-ID
+		header_up -X-Principal-ID
+		header_up -X-Subject-User-ID
+		header_up -X-Actor-ID
+	}
+}
+
+(memory_gateway_routes) {
+	@oauth_metadata path /.well-known/oauth-protected-resource
+	handle @oauth_metadata {
+		request_body {
+			max_size 16KB
+		}
+		import memory_gateway_proxy
+	}
+
+	@telegram path /api/v1/telegram/webhook
+	handle @telegram {
+		request_body {
+			max_size 256KB
+		}
+		import memory_gateway_proxy
+	}
+
+	@archive_import path /api/v1/memory-archives/private/import /api/v1/memory-archives/tenant/import
+	handle @archive_import {
+		request_body {
+			max_size 64MB
+		}
+		import memory_gateway_proxy
+	}
+
+	@mcp path /mcp /mcp/*
+	handle @mcp {
+		request_body {
+			max_size 2MB
+		}
+		import memory_gateway_proxy
+	}
+
+	@api path /api/v1/*
+	handle @api {
+		request_body {
+			max_size 2MB
+		}
+		import memory_gateway_proxy
+	}
+
+	handle {
+		respond 404
+	}
+}

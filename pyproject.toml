@@ -1,0 +1,113 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coengram"
+version = "0.1.0"
+description = "Sovereign, tenant-isolated memory for people and AI agents"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+authors = [
+  { name = "0xiDen", email = "0xiden@proton.me" },
+]
+requires-python = ">=3.12,<3.13"
+keywords = [
+  "activegraph",
+  "agent-memory",
+  "ai-agents",
+  "langchain",
+  "mcp",
+  "neo4j",
+  "self-hosted",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Web Environment",
+  "Framework :: FastAPI",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+  "activegraph[postgres]==1.10.0",
+  "aio-pika==9.6.2",
+  "alembic==1.18.5",
+  "fastapi==0.135.1",
+  "httpx==0.28.1",
+  "langchain-anthropic==1.5.3",
+  "langchain-core==1.5.3",
+  "mcp==1.28.1",
+  "neo4j-agent-memory[mcp,sentence-transformers]==0.5.0",
+  "opentelemetry-exporter-otlp-proto-http==1.44.0",
+  "opentelemetry-instrumentation-fastapi==0.65b0",
+  "opentelemetry-sdk==1.44.0",
+  "psycopg[binary]==3.3.4",
+  "psycopg-pool==3.3.1",
+  "pydantic==2.12.5",
+  "uvicorn[standard]==0.41.0",
+]
+
+[project.scripts]
+coengram-gateway = "agent_memory_service.server:main"
+coengram-worker = "agent_memory_service.worker:main"
+coengramctl = "agent_memory_service.cli:main"
+memory-gateway = "agent_memory_service.server:main"
+memory-worker = "agent_memory_service.worker:main"
+memoryctl = "agent_memory_service.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/0xiDen/coengram#readme"
+Issues = "https://github.com/0xiDen/coengram/issues"
+Repository = "https://github.com/0xiDen/coengram"
+
+[project.optional-dependencies]
+dev = [
+  "build==1.5.0",
+  "mypy==1.17.1",
+  "pytest==9.0.2",
+  "pytest-asyncio==1.3.0",
+  "ruff==0.12.7",
+  "twine==7.0.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_memory_service"]
+
+[tool.hatch.build]
+exclude = [
+  "/.mypy_cache",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.env",
+  "/build",
+  "/deploy/dev-secrets",
+  "/deploy/secrets/*",
+  "/dist",
+  "/secrets",
+  "**/__pycache__",
+  "**/*.age",
+  "**/*.pyc",
+  "!/deploy/secrets/README.md",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]

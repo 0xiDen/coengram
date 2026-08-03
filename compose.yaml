@@ -1,0 +1,350 @@
+name: coengram
+
+x-platform-image: &platform-image
+  build:
+    context: .
+  image: local/coengram:0.1.0
+
+x-platform-environment: &platform-environment
+  MEMORY_CONTROL_DATABASE_HOST: postgres
+  MEMORY_CONTROL_DATABASE_PORT: "5432"
+  MEMORY_CONTROL_DATABASE_NAME: memory_control
+  MEMORY_CONTROL_DATABASE_USER: memory_control
+  MEMORY_CONTROL_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+  MEMORY_TENANT_DATABASE_HOST: postgres
+  MEMORY_TENANT_CREDENTIALS_DIR: /run/secrets/tenants
+  MEMORY_EMBEDDING_MODEL: ${MEMORY_EMBEDDING_MODEL:-/opt/coengram/models/bge-small-en-v1.5}
+  MEMORY_EMBEDDING_DIMENSIONS: ${MEMORY_EMBEDDING_DIMENSIONS:-384}
+  MEMORY_PUBLIC_URL: http://127.0.0.1:${MEMORY_GATEWAY_PORT:-8080}
+  MEMORY_GATEWAY_HOST: 0.0.0.0
+  MEMORY_GATEWAY_PORT: "8080"
+  MEMORY_AMQP_HOST: rabbitmq
+  MEMORY_AMQP_PORT: "5672"
+  MEMORY_AMQP_USER: memory
+  MEMORY_AMQP_VHOST: memory
+  MEMORY_AMQP_PASSWORD_FILE: /run/secrets/rabbitmq_password
+  MEMORY_TELEMETRY_HMAC_KEY_FILE: /run/secrets/telemetry_hmac_key
+  MEMORY_AMQP_EXCHANGE: memory.events.v1
+  MEMORY_AMQP_GRAPH_QUEUE: memory.graph.apply.v1
+  MEMORY_AMQP_DEAD_LETTER_EXCHANGE: memory.dead-letter.v1
+  MEMORY_AMQP_DEAD_LETTER_QUEUE: memory.graph.dead-letter.v1
+  MEMORY_WORKER_METRICS_PORT: "9090"
+  MEMORY_OTEL_ENDPOINT: http://alloy:4318
+  MEMORY_SEED_TENANT_ID: tenant-a
+  HF_HOME: /models
+
+x-platform-volumes: &platform-volumes
+  - ./deploy/dev-secrets/tenants:/run/secrets/tenants:ro
+
+services:
+  postgres:
+    build:
+      context: ./deploy/postgres
+      target: local
+    image: local/memory-postgres:17.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: memory_control
+      POSTGRES_USER: memory_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+      POSTGRES_CONTROL_USER: memory_control
+      POSTGRES_EXPORTER_USER: memory_metrics
+      MEMORY_SEED_TENANT_ID: tenant-a
+    secrets:
+      - postgres_admin_password
+      - postgres_password
+      - postgres_exporter_password
+      - tenant_postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory_control -d memory_control"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [backplane]
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.19.1@sha256:e96064f876226d94bb6ce48a4c4b3dd76edba91168ec1ab024e5c4b959310b0f
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_URI: postgres:5432/memory_control?sslmode=disable
+      DATA_SOURCE_USER: memory_metrics
+      DATA_SOURCE_PASS_FILE: /run/secrets/postgres_exporter_password
+      PG_EXPORTER_COLLECTION_TIMEOUT: 10s
+    secrets: [postgres_exporter_password]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backplane]
+    labels:
+      memory.telemetry: "true"
+
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine@sha256:218487e5c22d92a990c7ad42133b7e8784c4956f8d395cd89ce2cac6abc8a8fa
+    restart: unless-stopped
+    environment:
+      MEMORY_RABBITMQ_SEED_USER: memory
+      MEMORY_RABBITMQ_SEED_PASSWORD_FILE: /run/secrets/rabbitmq_password
+    entrypoint: ["/bin/bash", "/etc/rabbitmq/memory-entrypoint.sh"]
+    command: ["rabbitmq-server"]
+    secrets: [rabbitmq_password]
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./deploy/rabbitmq/entrypoint.sh:/etc/rabbitmq/memory-entrypoint.sh:ro
+      - ./deploy/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [backplane]
+
+  neo4j-tenant-a:
+    image: neo4j:5.26.28-community@sha256:362542416de6c09a971484d1893878016cc3b5cdec166e54b1c824a220ecd6b9
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        export NEO4J_AUTH="neo4j/$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+        exec /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_server_bolt_advertised__address: neo4j-tenant-a:7687
+    secrets: [neo4j_password]
+    group_add: ["${TENANT_SECRETS_GID:?Set TENANT_SECRETS_GID to your numeric host group ID}"]
+    volumes:
+      - neo4j_tenant_a_data:/data
+      - neo4j_tenant_a_logs:/logs
+    ports:
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j
+          -p "$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+          'RETURN 1' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    networks: [backplane]
+    label_file:
+      - ./deploy/dev-secrets/tenant-a.labels
+    labels:
+      memory.neo4j_health: "true"
+
+  migrate-control:
+    <<: *platform-image
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets: [postgres_password]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        export CONTROL_DATABASE_URL="postgresql+psycopg://memory_control:$$(tr -d '\r\n'
+        < /run/secrets/postgres_password)@postgres:5432/memory_control";
+        exec alembic -c /app/alembic-control.ini upgrade head
+    networks: [backplane]
+
+  migrate-tenant:
+    <<: *platform-image
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets: [tenant_postgres_password]
+    group_add: ["${TENANT_SECRETS_GID:?Set TENANT_SECRETS_GID to your numeric host group ID}"]
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        export TENANT_DATABASE_URL="postgresql+psycopg://tenant_tenant_a_rw:$$(tr -d '\r\n'
+        < /run/secrets/tenant_postgres_password)@postgres:5432/tenant_tenant_a";
+        exec alembic -c /app/alembic-tenant.ini upgrade head
+    networks: [backplane]
+
+  seed-control:
+    <<: *platform-image
+    restart: "no"
+    depends_on:
+      migrate-control:
+        condition: service_completed_successfully
+    environment: *platform-environment
+    secrets: [postgres_password, telemetry_hmac_key]
+    volumes: *platform-volumes
+    group_add: ["${TENANT_SECRETS_GID:?Set TENANT_SECRETS_GID to your numeric host group ID}"]
+    command: ["python", "-m", "agent_memory_service.local_seed"]
+    networks: [backplane]
+
+  gateway:
+    <<: *platform-image
+    restart: unless-stopped
+    depends_on:
+      seed-control:
+        condition: service_completed_successfully
+      migrate-tenant:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      neo4j-tenant-a:
+        condition: service_healthy
+    environment: *platform-environment
+    secrets:
+      - postgres_password
+      - rabbitmq_password
+      - telemetry_hmac_key
+    volumes: *platform-volumes
+    group_add: ["${TENANT_SECRETS_GID:?Set TENANT_SECRETS_GID to your numeric host group ID}"]
+    command: ["coengram-gateway"]
+    ports:
+      - "127.0.0.1:${MEMORY_GATEWAY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-m", "agent_memory_service.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 2m
+    networks: [backplane, egress]
+    labels:
+      memory.telemetry: "true"
+
+  worker:
+    <<: *platform-image
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment: *platform-environment
+    secrets:
+      - postgres_password
+      - rabbitmq_password
+      - telemetry_hmac_key
+    volumes: *platform-volumes
+    group_add: ["${TENANT_SECRETS_GID:?Set TENANT_SECRETS_GID to your numeric host group ID}"]
+    command: ["coengram-worker"]
+    networks: [backplane, egress]
+    labels:
+      memory.telemetry: "true"
+
+  docker-socket-proxy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    command: ["caddy", "run", "--config", "/etc/caddy/docker-api-proxy.Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./deploy/docker-api-proxy/Caddyfile:/etc/caddy/docker-api-proxy.Caddyfile:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--output-document=-", "http://127.0.0.1:2375/_ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [docker-api]
+    labels:
+      memory.telemetry: "true"
+
+  alloy:
+    image: grafana/alloy:v1.10.2@sha256:bcf27f18c4402869af112fb39e35e1db3804a404686f4caa20bdf77814219223
+    restart: unless-stopped
+    depends_on:
+      docker-socket-proxy:
+        condition: service_healthy
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./ops/observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+    networks: [backplane, docker-api]
+    labels:
+      memory.telemetry: "true"
+
+  mimir:
+    image: grafana/mimir:2.17.1@sha256:f97a1a6885a0c8ee80bc8f14343183dd67e9786cfbc18198d9a4138354fda55e
+    restart: unless-stopped
+    command: ["-config.file=/etc/mimir/config.yaml"]
+    volumes:
+      - ./ops/observability/mimir/config.yaml:/etc/mimir/config.yaml:ro
+      - mimir_data:/data
+    networks: [backplane]
+
+  loki:
+    image: grafana/loki:3.5.5@sha256:31628519045e7f28692a7ae73b4a3fd293dccb425585ed5d16ceea3b5c9592e6
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./ops/observability/loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    networks: [backplane]
+
+  tempo:
+    image: grafana/tempo:2.8.2@sha256:0ef775495967cd5d7a6b2e146b6ea695d624803c8db8349fb8ce4164f719f9b7
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    volumes:
+      - ./ops/observability/tempo/config.yaml:/etc/tempo/config.yaml:ro
+      - tempo_data:/var/tempo
+    networks: [backplane]
+
+  grafana:
+    image: grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d
+    restart: unless-stopped
+    depends_on: [mimir, loki, tempo]
+    environment:
+      GF_SECURITY_ADMIN_USER: memory-operator
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    secrets: [grafana_admin_password]
+    volumes:
+      - ./ops/observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    networks: [backplane]
+
+secrets:
+  postgres_password:
+    file: ./deploy/dev-secrets/postgres_password
+  postgres_admin_password:
+    file: ./deploy/dev-secrets/postgres_admin_password
+  postgres_exporter_password:
+    file: ./deploy/dev-secrets/postgres_exporter_password
+  tenant_postgres_password:
+    file: ./deploy/dev-secrets/tenants/tenant-a/postgres_password
+  neo4j_password:
+    file: ./deploy/dev-secrets/tenants/tenant-a/neo4j_password
+  rabbitmq_password:
+    file: ./deploy/dev-secrets/rabbitmq_password
+  telemetry_hmac_key:
+    file: ./deploy/dev-secrets/telemetry_hmac_key
+  grafana_admin_password:
+    file: ./deploy/dev-secrets/grafana_admin_password
+
+networks:
+  backplane:
+    name: memory-backplane
+    internal: true
+  docker-api:
+    internal: true
+  egress:
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  neo4j_tenant_a_data:
+  neo4j_tenant_a_logs:
+  mimir_data:
+  loki_data:
+  tempo_data:
+  grafana_data:

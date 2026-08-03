@@ -1,0 +1,56 @@
+name: memory-tenant-${TENANT_ID:?Set TENANT_ID to the immutable Tenant identifier}
+
+services:
+  neo4j:
+    image: neo4j:${NEO4J_VERSION:-5.26.28-community}@${NEO4J_DIGEST:-sha256:362542416de6c09a971484d1893878016cc3b5cdec166e54b1c824a220ecd6b9}
+    restart: unless-stopped
+    # Neo4j does not consume NEO4J_AUTH from a Compose secret directly. This
+    # wrapper reads it in-process, then hands control to the upstream entrypoint.
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        export NEO4J_AUTH="neo4j/$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+        exec /startup/docker-entrypoint.sh neo4j
+    environment:
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_bolt_advertised__address: neo4j-${TENANT_ID}:7687
+    secrets:
+      - neo4j_password
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    networks:
+      backplane:
+        aliases:
+          - neo4j-${TENANT_ID}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -a bolt://127.0.0.1:7687 -u neo4j
+          -p "$$(tr -d '\r\n' < /run/secrets/neo4j_password)"
+          'RETURN 1' >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      memory.neo4j_health: "true"
+      memory.tenant_ref: ${TENANT_TELEMETRY_REF:?Set the server-derived opaque Tenant telemetry reference}
+
+secrets:
+  neo4j_password:
+    file: ${TENANT_SECRETS_DIR:?Set TENANT_SECRETS_DIR to this Tenant's protected secret directory}/neo4j_password
+
+networks:
+  backplane:
+    name: memory-backplane
+    external: true
+
+volumes:
+  neo4j_data:
+    name: memory-tenant-${TENANT_ID}-neo4j-data
+  neo4j_logs:
+    name: memory-tenant-${TENANT_ID}-neo4j-logs

@@ -1,0 +1,174 @@
+logging {
+  level  = "info"
+  format = "json"
+}
+
+// Only explicitly labelled containers enter the central log stream. Labels carry
+// opaque identifiers and service metadata; application log bodies must already be
+// redacted at their source.
+discovery.docker "memory_containers" {
+  host             = "http://docker-socket-proxy:2375"
+  refresh_interval = "10s"
+
+  filter {
+    name   = "label"
+    values = ["memory.telemetry=true"]
+  }
+}
+
+discovery.relabel "memory_containers" {
+  targets = discovery.docker.memory_containers.targets
+
+  // Only sources with content-safe logging contracts are collected. PostgreSQL
+  // and Neo4j stdout are deliberately excluded because error diagnostics can
+  // contain statement parameters or graph values; their health and metrics use
+  // separate probes/exporters below.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "caddy|gateway|worker|rabbitmq|postgres-exporter|docker-socket-proxy|alloy|mimir|loki|tempo|grafana"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service_name"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_memory_tenant_ref"]
+    target_label  = "tenant_ref"
+  }
+}
+
+// Neo4j Community does not expose the Enterprise metrics endpoint. Probe Bolt TCP
+// readiness instead. The target name and exported tenant_ref are both the
+// server-derived opaque label; raw Compose project/container names are discarded.
+discovery.docker "neo4j_health" {
+  host             = "http://docker-socket-proxy:2375"
+  refresh_interval = "10s"
+
+  filter {
+    name   = "label"
+    values = ["memory.neo4j_health=true"]
+  }
+}
+
+discovery.relabel "neo4j_health" {
+  targets = discovery.docker.neo4j_health.targets
+
+  rule {
+    source_labels = ["__meta_docker_network_name"]
+    regex         = "memory-backplane"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_memory_tenant_ref"]
+    target_label  = "name"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_memory_tenant_ref"]
+    target_label  = "tenant_ref"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_network_ip"]
+    regex         = "(.+)"
+    replacement   = "$1:7687"
+    target_label  = "address"
+  }
+
+  rule {
+    replacement  = "tcp_connect"
+    target_label = "module"
+  }
+}
+
+prometheus.exporter.blackbox "neo4j_bolt" {
+  config  = "{\"modules\":{\"tcp_connect\":{\"prober\":\"tcp\",\"timeout\":\"5s\"}}}"
+  targets = discovery.relabel.neo4j_health.output
+}
+
+loki.source.docker "memory_containers" {
+  host       = "http://docker-socket-proxy:2375"
+  targets    = discovery.relabel.memory_containers.output
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+prometheus.remote_write "mimir" {
+  endpoint {
+    url = "http://mimir:9009/api/v1/push"
+  }
+}
+
+prometheus.scrape "infrastructure" {
+  targets = [
+    { "__address__" = "caddy:9180", "job" = "caddy" },
+    { "__address__" = "gateway:8080", "job" = "gateway" },
+    { "__address__" = "worker:9090", "job" = "worker" },
+    { "__address__" = "rabbitmq:15692", "job" = "rabbitmq" },
+    { "__address__" = "postgres-exporter:9187", "job" = "postgres" },
+    { "__address__" = "mimir:9009", "job" = "mimir" },
+    { "__address__" = "loki:3100", "job" = "loki" },
+    { "__address__" = "tempo:3200", "job" = "tempo" },
+    { "__address__" = "grafana:3000", "job" = "grafana" },
+    { "__address__" = "alloy:12345", "job" = "alloy" },
+  ]
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.scrape "neo4j_bolt" {
+  targets         = prometheus.exporter.blackbox.neo4j_bolt.targets
+  scrape_interval = "15s"
+  forward_to      = [prometheus.remote_write.mimir.receiver]
+}
+
+otelcol.exporter.prometheus "mimir" {
+  forward_to = [prometheus.remote_write.mimir.receiver]
+}
+
+otelcol.exporter.loki "loki" {
+  forward_to = [loki.write.default.receiver]
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+
+    tls {
+      insecure = true
+    }
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    metrics = [otelcol.exporter.prometheus.mimir.input]
+    logs    = [otelcol.exporter.loki.loki.input]
+    traces  = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    metrics = [otelcol.processor.batch.default.input]
+    logs    = [otelcol.processor.batch.default.input]
+    traces  = [otelcol.processor.batch.default.input]
+  }
+}

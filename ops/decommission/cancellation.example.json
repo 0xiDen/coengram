@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "request_id": "decom-product-a-backend-20260802",
+  "tenant_id": "tenant-product-a-backend",
+  "actor_id": "operator-carol",
+  "cancelled_at": "2026-08-03T12:00:00Z"
+}

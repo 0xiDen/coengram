@@ -1,0 +1,57 @@
+name: Bug report
+description: Report reproducible incorrect behavior without sharing private data.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include credentials, tokens, deployment hostnames, memory content,
+        prompts, Telegram text, or private Tenant identifiers. Report vulnerabilities
+        through the private process in SECURITY.md.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide redacted commands, fixtures, and the smallest reproducible sequence.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - HTTP gateway
+        - MCP / Claude
+        - Agent runtime
+        - Telegram
+        - Operator CLI
+        - Compose / Caddy
+        - Storage / consistency
+        - Observability
+        - Backup / restore / decommission
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed all real secrets, hostnames, memory content, and private identifiers.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

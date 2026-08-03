@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "tenant_id": "tenant-product-a-backend",
+  "name": "Product A Backend",
+  "principals": [
+    {
+      "principal_id": "user-alice",
+      "name": "Alice",
+      "kind": "user"
+    },
+    {
+      "principal_id": "agent-knowledge-synthesis",
+      "name": "Knowledge Synthesis Agent",
+      "kind": "agent"
+    }
+  ],
+  "memberships": [
+    {
+      "principal_id": "user-alice",
+      "roles": [
+        "knowledge_curator",
+        "tenant_administrator",
+        "tenant_member"
+      ]
+    },
+    {
+      "principal_id": "agent-knowledge-synthesis",
+      "roles": [
+        "tenant_member"
+      ]
+    }
+  ],
+  "policies": {
+    "user_token_lifetime_days": 90,
+    "delegated_agent_token_lifetime_days": 90,
+    "autonomous_agent_token_lifetime_days": 30,
+    "automatic_private_retention": true,
+    "promotion_requires_human_review": true,
+    "erasure_requires_admin_approval": true
+  }
+}

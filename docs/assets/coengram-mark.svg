@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" role="img" aria-labelledby="title description">
+  <title id="title">CoEngram graph mark</title>
+  <desc id="description">A luminous C-shaped knowledge graph.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10152f"/>
+      <stop offset="1" stop-color="#080a17"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="30" y1="25" x2="128" y2="137" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c5cff"/>
+      <stop offset="0.52" stop-color="#32d6d2"/>
+      <stop offset="1" stop-color="#80f7b7"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="160" height="160" rx="36" fill="url(#background)"/>
+  <path d="M121 42A54 54 0 1 0 121 118" fill="none" stroke="url(#signal)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M49 56L80 42L104 65L94 95L61 106M80 42L61 106M49 56L94 95M104 65L126 80L121 118" fill="none" stroke="url(#signal)" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
+  <g fill="#e9fffb" stroke="url(#signal)" stroke-width="4" filter="url(#glow)">
+    <circle cx="49" cy="56" r="5"/>
+    <circle cx="80" cy="42" r="5"/>
+    <circle cx="104" cy="65" r="5"/>
+    <circle cx="126" cy="80" r="5"/>
+    <circle cx="94" cy="95" r="5"/>
+    <circle cx="61" cy="106" r="5"/>
+    <circle cx="121" cy="118" r="5"/>
+  </g>
+</svg>

@@ -1,0 +1,3 @@
+# Separate agent execution truth from memory
+
+Agent execution remains separate from recallable memory. ActiveGraph owns native Pack behavior dispatch and replay, while the Tenant Operations Store owns the fenced Agent Run write-ahead snapshot described by ADR 0016. Tenant PostgreSQL also owns authoritative memory commands and desired state; Neo4j Agent Memory is their idempotent recall projection. LangChain supplies model and tool adapters only. Durable outcomes cross into memory through the Memory Module, preventing workflow events, recall projections, and framework state from becoming competing sources of truth.

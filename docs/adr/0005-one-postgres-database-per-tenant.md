@@ -1,0 +1,3 @@
+# Partition a shared PostgreSQL server by Tenant database
+
+One self-hosted PostgreSQL server hosts a content-free `memory_control` database and one immutable-ID-named database per Tenant. Each Tenant database uses its own role and separates memory governance from ActiveGraph events by schema, giving the system a single PostgreSQL process to operate while preventing Tenant roles from reading another Tenant's Promotion, provenance, audit, or execution data. The bootstrap `memory_admin` credential is host-only; gateway and worker receive only the least-privilege Control Store role plus exact routed Tenant credentials.

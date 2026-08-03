@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "request_id": "decom-product-a-backend-20260802",
+  "actor_id": "operator-alice",
+  "reason": "engineering team retired",
+  "requested_at": "2026-08-02T12:00:00Z",
+  "protection_policy": "recent-valid-backup-or-accepted-export",
+  "resources": {
+    "tenant_id": "tenant-product-a-backend",
+    "compose_project": "memory-tenant-tenant-product-a-backend",
+    "neo4j_volume": "memory-tenant-tenant-product-a-backend-neo4j-data",
+    "database_name": "tenant_tenant_product_a_backend",
+    "database_role": "tenant_tenant_product_a_backend_rw",
+    "route_id": "route:tenant-product-a-backend",
+    "tenant_secret_ref": "/run/memory-tenants/tenant-product-a-backend"
+  }
+}
