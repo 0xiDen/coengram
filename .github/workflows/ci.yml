@@ -39,7 +39,9 @@ jobs:
           sudo apt-get install --yes age postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
           sudo apt-get install --yes postgresql-client-17
-          pg_dump --version | grep --extended-regexp '^pg_dump \(PostgreSQL\) 17[.]'
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+          "/usr/lib/postgresql/17/bin/pg_dump" --version \
+            | grep --extended-regexp '^pg_dump \(PostgreSQL\) 17[.]'
 
       - name: Install CoEngram with development dependencies
         run: python -m pip install --disable-pip-version-check -e '.[dev]'

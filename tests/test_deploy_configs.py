@@ -482,9 +482,12 @@ def test_runtime_and_recovery_images_are_immutable_by_default() -> None:
 
 
 def test_release_publication_order_and_dependency_update_scope_are_safe() -> None:
+    ci = read(ROOT / ".github" / "workflows" / "ci.yml")
     release = read(ROOT / ".github" / "workflows" / "release.yml")
     dependabot = read(ROOT / ".github" / "dependabot.yml")
 
+    assert 'echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"' in ci
+    assert '"/usr/lib/postgresql/17/bin/pg_dump" --version' in ci
     assert re.search(
         r"^  publish-pypi:\n(?:.*\n)*?    needs: \[build-python, publish-container\]$",
         release,
