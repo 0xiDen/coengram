@@ -71,7 +71,7 @@ Repository = "https://github.com/0xiDen/coengram"
 dev = [
   "build==1.5.0",
   "mypy==1.17.1",
-  "pytest==9.0.2",
+  "pytest==9.1.1",
   "pytest-asyncio==1.3.0",
   "ruff==0.12.7",
   "twine==7.0.0",
