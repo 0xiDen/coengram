@@ -5,7 +5,10 @@ FROM postgres:${POSTGRES_VERSION}@${POSTGRES_DIGEST} AS control
 
 # The upstream entrypoint sources non-executable .sh files. Copying them into the
 # image avoids host bind-mount execution differences while keeping secrets runtime-only.
+COPY --chmod=0555 entrypoint.sh /usr/local/bin/coengram-postgres-entrypoint
 COPY --chmod=0444 init-control.sh /docker-entrypoint-initdb.d/10-memory-control.sh
+ENTRYPOINT ["/usr/local/bin/coengram-postgres-entrypoint"]
+CMD ["postgres"]
 
 FROM control AS local
 

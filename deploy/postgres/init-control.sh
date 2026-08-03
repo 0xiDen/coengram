@@ -2,9 +2,11 @@
 set -eu
 
 control_user="${POSTGRES_CONTROL_USER:-memory_control}"
-control_password="$(tr -d '\r\n' < /run/secrets/postgres_password)"
+control_password_file="${POSTGRES_CONTROL_PASSWORD_FILE:-/run/secrets/postgres_password}"
+control_password="$(tr -d '\r\n' < "$control_password_file")"
 exporter_user="${POSTGRES_EXPORTER_USER:-memory_metrics}"
-exporter_password="$(tr -d '\r\n' < /run/secrets/postgres_exporter_password)"
+exporter_password_file="${POSTGRES_EXPORTER_PASSWORD_FILE:-/run/secrets/postgres_exporter_password}"
+exporter_password="$(tr -d '\r\n' < "$exporter_password_file")"
 
 case "$control_user" in
   *[!a-z0-9_]*|'')

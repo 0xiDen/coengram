@@ -328,11 +328,27 @@ def test_postgres_bootstrap_admin_is_separate_from_control_application_role() ->
 
 def test_postgres_init_scripts_are_built_as_source_only_files() -> None:
     dockerfile = read(DEPLOY / "postgres" / "Dockerfile")
+    entrypoint = read(DEPLOY / "postgres" / "entrypoint.sh")
+    control_initializer = read(DEPLOY / "postgres" / "init-control.sh")
+    tenant_initializer = read(DEPLOY / "postgres" / "init-tenants.sh")
 
     assert "FROM postgres:${POSTGRES_VERSION}@${POSTGRES_DIGEST}" in dockerfile
     assert re.search(r"^ARG POSTGRES_DIGEST=sha256:[0-9a-f]{64}$", dockerfile, re.MULTILINE)
+    assert "COPY --chmod=0555 entrypoint.sh /usr/local/bin/coengram-postgres-entrypoint" in (
+        dockerfile
+    )
+    assert 'ENTRYPOINT ["/usr/local/bin/coengram-postgres-entrypoint"]' in dockerfile
+    assert 'CMD ["postgres"]' in dockerfile
     assert "COPY --chmod=0444 init-control.sh" in dockerfile
     assert "COPY --chmod=0444 init-tenants.sh" in dockerfile
+    assert 'runtime_directory="/run/coengram-postgres-secrets"' in entrypoint
+    assert 'exec /usr/local/bin/docker-entrypoint.sh "$@"' in entrypoint
+    assert "POSTGRES_CONTROL_PASSWORD_FILE" in entrypoint
+    assert "POSTGRES_EXPORTER_PASSWORD_FILE" in entrypoint
+    assert "POSTGRES_TENANT_PASSWORD_FILE" in entrypoint
+    assert "POSTGRES_CONTROL_PASSWORD_FILE" in control_initializer
+    assert "POSTGRES_EXPORTER_PASSWORD_FILE" in control_initializer
+    assert "POSTGRES_TENANT_PASSWORD_FILE" in tenant_initializer
 
 
 def test_rabbitmq_uses_supported_file_secret_loading_and_versioned_topology_names() -> None:

@@ -37,6 +37,12 @@ mounted into gateway, worker, or migrations. `memory_control` owns only the
 only into the internal PostgreSQL exporter. Every Tenant database has another,
 distinct Tenant role credential.
 
+On Linux, Compose bind-mounted file secrets retain host ownership and mode. The custom
+PostgreSQL entrypoint therefore copies only the database secrets into a root-owned
+runtime directory, changes each copy to `postgres:postgres` mode `0400`, and then hands
+control to the upstream entrypoint. Secret values remain file-backed and the protected
+host files can stay owner-only mode `0600`.
+
 ## Shared services
 
 Copy `shared.env.example` to an operator-owned environment file. Create a dedicated

@@ -10,7 +10,8 @@ case "$tenant_id" in
 esac
 tenant_database="tenant_$(printf '%s' "$tenant_id" | tr '-' '_')"
 tenant_role="${tenant_database}_rw"
-tenant_password="$(tr -d '\r\n' < /run/secrets/tenant_postgres_password)"
+tenant_password_file="${POSTGRES_TENANT_PASSWORD_FILE:-/run/secrets/tenant_postgres_password}"
+tenant_password="$(tr -d '\r\n' < "$tenant_password_file")"
 
 case "$tenant_password" in
   *[!A-Za-z0-9_-]*|'')
