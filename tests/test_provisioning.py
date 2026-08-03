@@ -262,6 +262,20 @@ def test_apply_runs_every_step_and_activates_only_after_all_checks() -> None:
     assert all(re.fullmatch(r"[A-Za-z0-9_-]+", value) for value, _ in secret_writer.values.values())
 
 
+def test_generated_service_credentials_cannot_begin_as_cli_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "agent_memory_service.provisioning.secrets.token_urlsafe",
+        lambda _length: "-looks-like-a-command-option-but-is-long-enough",
+    )
+    service, _states, secret_writer, _database, _events = provisioner()
+
+    service.apply(manifest())
+
+    assert all(value.startswith("c") for value, _mode in secret_writer.values.values())
+
+
 def test_failure_is_visible_and_reapply_resumes_after_last_completed_step() -> None:
     tenant = manifest()
     failing_event = f"verify_routing:{tenant.tenant_id}"

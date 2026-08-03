@@ -387,7 +387,7 @@ class TenantProvisioner:
                 self._secrets.ensure_secret(
                     manifest.tenant_id,
                     name,
-                    secrets.token_urlsafe(48),
+                    f"c{secrets.token_urlsafe(48)}",
                     mode=TENANT_SECRET_FILE_MODE,
                 )
         elif step is ProvisioningStep.START_NEO4J:

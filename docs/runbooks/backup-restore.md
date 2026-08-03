@@ -160,6 +160,12 @@ Restore control metadata into an isolated namespace, then the tenant PostgreSQL
 database and tenant Neo4j volume. Do not register an active route. Exercise the
 same public interfaces used in production and record whether all checks pass:
 
+The offline Neo4j loader remains on `--network none` with a deterministic local
+hostname. It receives a read-only, mode-`0750` handoff directory containing only the
+temporarily group-readable `neo4j.dump`; the surrounding mode-`0700` workspace and all
+other decrypted artifacts remain inaccessible. The dump returns to mode `0600` and the
+handoff is removed on every outcome.
+
 - authenticated typed HTTP Tenant Knowledge recall, requiring at least one result whose
   stable digest was captured before backup, plus complete graph-listing equivalence;
 - Private Memory inspection, archive, and recall through the canonical Memory Module

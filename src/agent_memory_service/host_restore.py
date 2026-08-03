@@ -33,7 +33,7 @@ from agent_memory_service.schema import CONTROL_SCHEMA_REVISION, TENANT_SCHEMA_R
 _SAFE_TENANT_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
 _SAFE_TARGET_ID = re.compile(r"^restore-drill-[a-z0-9](?:[a-z0-9-]{0,119}[a-z0-9])?$")
 _SAFE_OPERATOR_ID = re.compile(r"^[A-Za-z0-9._:@-]{1,160}$")
-_SAFE_SECRET = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+_SAFE_SECRET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{15,255}$")
 _SAFE_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$")
 _SAFE_POSTGRES_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _NEO4J_SCHEMA_REVISION = "1"
@@ -169,7 +169,7 @@ class HostRestoreDrillExecutor:
         self._config = config
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleeper = sleeper or time.sleep
-        self._secret_factory = secret_factory or (lambda: secrets.token_urlsafe(32))
+        self._secret_factory = secret_factory or (lambda: f"c{secrets.token_urlsafe(32)}")
         self._workspace_root = config.workspace_root.resolve()
 
     def execute(
@@ -423,7 +423,12 @@ class HostRestoreDrillExecutor:
         workspace: Path,
     ) -> None:
         dump = workspace / "neo4j.dump"
-        dump.chmod(0o640)
+        handoff = workspace / "neo4j-load"
+        staged_dump = handoff / dump.name
+        handoff.mkdir(mode=0o750)
+        handoff.chmod(0o750)
+        dump.rename(staged_dump)
+        staged_dump.chmod(0o640)
         try:
             self._run(
                 "docker",
@@ -432,6 +437,10 @@ class HostRestoreDrillExecutor:
                 resources.neo4j_loader,
                 "--network",
                 "none",
+                "--hostname",
+                "coengram-neo4j-offline",
+                "--add-host",
+                "coengram-neo4j-offline:127.0.0.1",
                 "--read-only",
                 "--cap-drop",
                 "ALL",
@@ -448,7 +457,7 @@ class HostRestoreDrillExecutor:
                 "--volume",
                 f"{resources.neo4j_volume}:/data",
                 "--volume",
-                f"{workspace}:/backups:ro",
+                f"{handoff}:/backups:ro",
                 "--entrypoint",
                 "/var/lib/neo4j/bin/neo4j-admin",
                 self._config.neo4j_image,
@@ -459,7 +468,12 @@ class HostRestoreDrillExecutor:
                 "--overwrite-destination=true",
             )
         finally:
-            dump.chmod(0o600)
+            if staged_dump.exists():
+                staged_dump.chmod(0o600)
+                staged_dump.rename(dump)
+            if dump.exists():
+                dump.chmod(0o600)
+            handoff.rmdir()
 
     def _start_postgres(
         self,

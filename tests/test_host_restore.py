@@ -231,6 +231,28 @@ def _executor(
     )
 
 
+def test_restore_credentials_reject_cli_option_prefixes(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "restore-workspaces"
+    workspace_root.mkdir()
+    executor = HostRestoreDrillExecutor(
+        runner=RecordingRunner(),
+        verifier=FixedVerifier(
+            RestoreVerificationReport(
+                public_recall=True,
+                private_memory=True,
+                governance=True,
+                agent_runs=True,
+                tenant_isolation=True,
+            )
+        ),
+        config=HostRestoreConfig(workspace_root=workspace_root),
+        secret_factory=lambda: "-looks-like-a-command-option",
+    )
+
+    with pytest.raises(RestoreSafetyError, match="credential is invalid"):
+        executor._new_secret()
+
+
 def test_successful_restore_is_internal_fixed_argv_and_cleans_exact_resources(
     tmp_path: Path,
 ) -> None:
@@ -286,6 +308,8 @@ def test_successful_restore_is_internal_fixed_argv_and_cleans_exact_resources(
         command for command in runner.commands if "database" in command and "load" in command
     )
     assert loader[loader.index("--cap-drop") + 1] == "ALL"
+    assert loader[loader.index("--hostname") + 1] == "coengram-neo4j-offline"
+    assert loader[loader.index("--add-host") + 1] == "coengram-neo4j-offline:127.0.0.1"
     assert loader[loader.index("--user") + 1] == f"7474:{os.getgid()}"
     assert f"/tmp:rw,nosuid,nodev,exec,size=64m,mode=1777,uid=7474,gid={os.getgid()}" in loader
     assert f"/logs:rw,nosuid,nodev,noexec,size=64m,mode=0750,uid=7474,gid={os.getgid()}" in loader
@@ -602,6 +626,8 @@ def test_restore_command_failure_preserves_workspace_and_created_resources(
 
 def test_failed_neo4j_load_restores_private_dump_permissions(tmp_path: Path) -> None:
     class FailingLoader(RecordingRunner):
+        handoff: Path | None = None
+
         def run(
             self,
             arguments: Sequence[str],
@@ -610,6 +636,13 @@ def test_failed_neo4j_load_restores_private_dump_permissions(tmp_path: Path) -> 
         ) -> None:
             super().run(arguments, environment=environment)
             if "database" in arguments and "load" in arguments:
+                backup_mount = next(
+                    argument for argument in arguments if argument.endswith(":/backups:ro")
+                )
+                self.handoff = Path(backup_mount.removesuffix(":/backups:ro"))
+                assert self.handoff.stat().st_mode & 0o777 == 0o750
+                assert tuple(path.name for path in self.handoff.iterdir()) == ("neo4j.dump",)
+                assert (self.handoff / "neo4j.dump").stat().st_mode & 0o777 == 0o640
                 raise RuntimeError("neo4j load failed")
 
     manifest, ciphertext_paths = _manifest(tmp_path)
@@ -640,6 +673,8 @@ def test_failed_neo4j_load_restores_private_dump_permissions(tmp_path: Path) -> 
 
     dump = tmp_path / "restore-workspaces" / "restore-drill-neo4j-load-failure" / "neo4j.dump"
     assert dump.stat().st_mode & 0o777 == 0o600
+    assert runner.handoff is not None
+    assert not runner.handoff.exists()
 
 
 def test_docker_verifier_runs_inside_internal_network_without_secrets_in_argv(
