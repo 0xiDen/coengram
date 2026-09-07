@@ -7,7 +7,12 @@ from fastapi.testclient import TestClient
 
 from agent_memory_service.auth import TokenService
 from agent_memory_service.control import ControlModule, InMemoryControlStore
-from agent_memory_service.governance import InMemoryGovernanceStore, ProposeKnowledge
+from agent_memory_service.governance import (
+    InMemoryGovernanceStore,
+    ProposeKnowledge,
+    ReviewDecision,
+    ReviewKnowledge,
+)
 from agent_memory_service.http import create_http_app
 from agent_memory_service.memory import MemoryModule
 from agent_memory_service.models import PrincipalKind, RetainMemory, TenantSession
@@ -445,6 +450,108 @@ def test_knowledge_candidate_admin_routes_reject_unknown_tenant() -> None:
     listed = client.get("/api/v1/admin/tenants/tenant-missing/knowledge-candidates")
 
     assert listed.status_code == 404
+
+
+def test_support_lens_exposes_memory_metadata_and_graph_without_private_content() -> None:
+    store = InMemoryControlStore()
+    control = ControlModule(store, TokenService(store))
+    control.create_tenant("tenant-a", "Product A")
+    control.create_operator(
+        "operator-support",
+        "Support",
+        frozenset({"audit_viewer", "tenant_support"}),
+    )
+    credential = control.issue_operator_access_token("operator-support")
+    memory = MemoryModule(
+        InMemoryTenantMemoryRouter(["tenant-a"]),
+        InMemoryGovernanceStore(),
+    )
+
+    async def seed_memory() -> tuple[str, str, str]:
+        session = TenantSession(
+            tenant_id="tenant-a",
+            actor_id="user-alice",
+            actor_kind=PrincipalKind.USER,
+            roles=frozenset({"tenant_member"}),
+        )
+        source = await memory.retain(
+            session,
+            RetainMemory(
+                content="Private support-only rollout detail.",
+                idempotency_key="support-lens-private-source",
+            ),
+        )
+        candidate = await memory.propose_knowledge(
+            session,
+            ProposeKnowledge(
+                claim="Product A uses Support Lens rollout checks.",
+                source_memory_ids=(source.id,),
+                idempotency_key="support-lens-candidate",
+            ),
+        )
+        await memory.review_operator_knowledge(
+            "tenant-a",
+            "operator-support",
+            ReviewKnowledge(
+                candidate_id=candidate.id,
+                decision=ReviewDecision.APPROVE,
+                rationale="Safe tenant knowledge.",
+                idempotency_key="support-lens-review",
+            ),
+        )
+        published = await memory.publish_next("tenant-a")
+        assert published is not None
+        knowledge_items = await memory.list_operator_tenant_knowledge("tenant-a")
+        return source.id, candidate.id, knowledge_items[0].id
+
+    source_id, candidate_id, published_id = asyncio.run(seed_memory())
+    client = TestClient(create_http_app(memory, TokenService(store), control=control))
+    client.post("/api/v1/admin/session", json={"access_token": credential.access_token})
+
+    private_metadata = client.get(
+        "/api/v1/admin/tenants/tenant-a/memory/private",
+        params={"principal_id": "user-alice"},
+    )
+    tenant_knowledge = client.get("/api/v1/admin/tenants/tenant-a/memory/tenant-knowledge")
+    graph = client.get("/api/v1/admin/tenants/tenant-a/knowledge-graph")
+
+    assert private_metadata.status_code == 200
+    private_item = private_metadata.json()["items"][0]
+    assert private_item["memory_id"] == source_id
+    assert private_item["owner_principal_id"] == "user-alice"
+    assert "content" not in private_item
+    assert "Private support-only rollout detail" not in private_metadata.text
+
+    assert tenant_knowledge.status_code == 200
+    knowledge_item = tenant_knowledge.json()["items"][0]
+    assert knowledge_item["memory_id"] == published_id
+    assert knowledge_item["content"] == "Product A uses Support Lens rollout checks."
+
+    assert graph.status_code == 200
+    graph_body = graph.json()
+    graph_node_ids = {node["node_id"] for node in graph_body["nodes"]}
+    graph_edges = {
+        (edge["source_id"], edge["target_id"], edge["label"])
+        for edge in graph_body["edges"]
+    }
+    assert f"candidate:{candidate_id}" in graph_node_ids
+    assert f"knowledge:{published_id}" in graph_node_ids
+    assert (
+        f"candidate:{candidate_id}",
+        f"knowledge:{published_id}",
+        "published",
+    ) in graph_edges
+    assert "Private support-only rollout detail" not in graph.text
+
+    audit = client.get("/api/v1/admin/audit-events")
+    assert audit.status_code == 200
+    actions = {event["action"] for event in audit.json()["events"]}
+    assert {
+        "support_lens.private_memory_metadata.view",
+        "support_lens.tenant_knowledge.view",
+        "support_lens.knowledge_graph.view",
+    } <= actions
+    assert "Private support-only rollout detail" not in audit.text
 
 
 def test_admin_user_onboarding_requires_identity_role_and_csrf() -> None:

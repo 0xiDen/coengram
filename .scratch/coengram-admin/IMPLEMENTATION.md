@@ -185,6 +185,14 @@ Second slice completed locally:
 - Support Lens ADR recording why future user troubleshooting must not become literal
   Operator impersonation by default.
 
+Third slice completed locally:
+
+- Support Lens API for content-free Private Memory metadata and published Tenant Knowledge.
+- Lightweight Knowledge Graph document derived from governance records and published
+  Tenant Knowledge, with source Private Memory represented only by counts.
+- Chakra Memory page with tenant/principal selection, metadata and Tenant Knowledge tables,
+  and an inline graph visualization.
+
 Validation blockers:
 
 - Full-suite Docker proxy integration cannot run until Docker is reachable locally.

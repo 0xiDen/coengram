@@ -4,13 +4,16 @@ import type {
   AuditEvent,
   Credential,
   KnowledgeCandidate,
+  KnowledgeGraph,
   Membership,
   Operator,
   OperatorTokenRecord,
   Principal,
+  PrivateMemoryMetadata,
   ProvisioningJob,
   RotatedCredential,
   Tenant,
+  TenantKnowledgeItem,
   TokenRecord
 } from "./types";
 
@@ -254,6 +257,28 @@ export async function reviewKnowledgeCandidate(
       body
     }
   );
+}
+
+export async function listPrivateMemoryMetadata(
+  tenantId: string,
+  principalId: string
+): Promise<PrivateMemoryMetadata[]> {
+  const search = new URLSearchParams({ principal_id: principalId });
+  const result = await request<{ items: PrivateMemoryMetadata[] }>(
+    `/tenants/${encodeURIComponent(tenantId)}/memory/private?${search.toString()}`
+  );
+  return result.items;
+}
+
+export async function listTenantKnowledge(tenantId: string): Promise<TenantKnowledgeItem[]> {
+  const result = await request<{ items: TenantKnowledgeItem[] }>(
+    `/tenants/${encodeURIComponent(tenantId)}/memory/tenant-knowledge`
+  );
+  return result.items;
+}
+
+export async function loadKnowledgeGraph(tenantId: string): Promise<KnowledgeGraph> {
+  return request<KnowledgeGraph>(`/tenants/${encodeURIComponent(tenantId)}/knowledge-graph`);
 }
 
 export async function createProvisioningJob(

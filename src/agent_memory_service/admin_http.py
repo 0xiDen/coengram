@@ -24,6 +24,7 @@ from agent_memory_service.governance import (
 )
 from agent_memory_service.manifest import TenantManifest
 from agent_memory_service.memory import MemoryModule
+from agent_memory_service.models import MemoryItem, PrivateMemoryInspection
 from agent_memory_service.operator_audit import OperatorAuditEventView, operator_audit_event_view
 from agent_memory_service.operator_auth import (
     IssuedAdminSession,
@@ -61,6 +62,7 @@ IDENTITY_VISIBLE_ROLES = frozenset(
 TOKEN_VISIBLE_ROLES = frozenset({"token_admin", "audit_viewer", "operator_admin"})
 TOKEN_MUTATION_ROLES = frozenset({"token_admin", "operator_admin"})
 KNOWLEDGE_ROLES = frozenset({"knowledge_admin", "operator_admin"})
+SUPPORT_LENS_ROLES = frozenset({"tenant_support", "knowledge_admin", "operator_admin"})
 
 
 class AdminLoginBody(BaseModel):
@@ -289,6 +291,68 @@ class ReviewKnowledgeCandidateBody(BaseModel):
     decision: ReviewDecision
     rationale: str = Field(min_length=1, max_length=4_000)
     idempotency_key: str = Field(min_length=1, max_length=255)
+
+
+class PrivateMemoryMetadataView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    memory_id: str
+    owner_principal_id: str
+    state: str
+    operation_id: str | None
+    mutation_state: str
+    kind: str | None
+    confidence: float | None
+    created_at: str
+    supersedes_id: str | None
+
+
+class PrivateMemoryMetadataListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: tuple[PrivateMemoryMetadataView, ...]
+
+
+class TenantKnowledgeItemView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    memory_id: str
+    content: str
+    kind: str
+    confidence: float
+    provenance_actor_id: str
+    provenance_source: str
+    created_at: str
+
+
+class TenantKnowledgeListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: tuple[TenantKnowledgeItemView, ...]
+
+
+class KnowledgeGraphNodeView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    node_id: str
+    node_type: str
+    label: str
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class KnowledgeGraphEdgeView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_id: str
+    target_id: str
+    label: str
+
+
+class KnowledgeGraphView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    nodes: tuple[KnowledgeGraphNodeView, ...]
+    edges: tuple[KnowledgeGraphEdgeView, ...]
 
 
 class OperatorAuditEventListView(BaseModel):
@@ -789,6 +853,100 @@ def mount_admin_routes(
         )
         return candidate
 
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/memory/private",
+        response_model=PrivateMemoryMetadataListView,
+    )
+    async def list_admin_private_memory_metadata(
+        tenant_id: str,
+        principal_id: str,
+        request: Request,
+    ) -> PrivateMemoryMetadataListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            items = await module.list_operator_private_memory_metadata(tenant_id, principal_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.private_memory_metadata.view",
+            target_type="private_memory",
+            target_ids={"tenant_id": tenant_id, "principal_id": principal_id},
+            after_metadata={"item_count": str(len(items))},
+        )
+        return PrivateMemoryMetadataListView(
+            items=tuple(_private_memory_metadata_view(item) for item in items)
+        )
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/memory/tenant-knowledge",
+        response_model=TenantKnowledgeListView,
+    )
+    async def list_admin_tenant_knowledge(
+        tenant_id: str,
+        request: Request,
+    ) -> TenantKnowledgeListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            items = await module.list_operator_tenant_knowledge(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.tenant_knowledge.view",
+            target_type="tenant_knowledge",
+            target_ids={"tenant_id": tenant_id},
+            after_metadata={"item_count": str(len(items))},
+        )
+        return TenantKnowledgeListView(
+            items=tuple(_tenant_knowledge_item_view(item) for item in items)
+        )
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-graph",
+        response_model=KnowledgeGraphView,
+    )
+    async def inspect_admin_knowledge_graph(
+        tenant_id: str,
+        request: Request,
+    ) -> KnowledgeGraphView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidates = await module.list_operator_knowledge_candidates(tenant_id)
+            knowledge_items = await module.list_operator_tenant_knowledge(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        graph = _knowledge_graph_view(tenant_id, candidates, knowledge_items)
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.knowledge_graph.view",
+            target_type="knowledge_graph",
+            target_ids={"tenant_id": tenant_id},
+            after_metadata={
+                "node_count": str(len(graph.nodes)),
+                "edge_count": str(len(graph.edges)),
+            },
+        )
+        return graph
+
     @app.post(
         "/api/v1/admin/provisioning-jobs",
         response_model=ProvisioningJobView,
@@ -966,6 +1124,140 @@ def _membership_view(membership: MembershipRecord) -> MembershipView:
         principal_id=membership.principal_id,
         roles=tuple(sorted(membership.roles)),
         active=membership.active,
+    )
+
+
+def _private_memory_metadata_view(item: PrivateMemoryInspection) -> PrivateMemoryMetadataView:
+    return PrivateMemoryMetadataView(
+        memory_id=item.id,
+        owner_principal_id=item.owner_principal_id,
+        state=item.state.value,
+        operation_id=item.operation_id,
+        mutation_state=item.mutation_state.value,
+        kind=None if item.kind is None else item.kind.value,
+        confidence=item.confidence,
+        created_at=item.created_at.isoformat(),
+        supersedes_id=item.supersedes_id,
+    )
+
+
+def _tenant_knowledge_item_view(item: MemoryItem) -> TenantKnowledgeItemView:
+    return TenantKnowledgeItemView(
+        memory_id=item.id,
+        content=item.content,
+        kind=item.kind.value,
+        confidence=item.confidence,
+        provenance_actor_id=item.provenance.actor_id,
+        provenance_source=item.provenance.source,
+        created_at=item.created_at.isoformat(),
+    )
+
+
+def _knowledge_graph_view(
+    tenant_id: str,
+    candidates: tuple[KnowledgeCandidateView, ...],
+    knowledge_items: tuple[MemoryItem, ...],
+) -> KnowledgeGraphView:
+    nodes: dict[str, KnowledgeGraphNodeView] = {
+        f"tenant:{tenant_id}": KnowledgeGraphNodeView(
+            node_id=f"tenant:{tenant_id}",
+            node_type="tenant",
+            label=tenant_id,
+        )
+    }
+    edges: list[KnowledgeGraphEdgeView] = []
+
+    def add_actor(actor_id: str) -> str:
+        if actor_id.startswith("operator:"):
+            node_type = "operator"
+            node_id = actor_id
+        else:
+            node_type = "principal"
+            node_id = f"principal:{actor_id}"
+        nodes.setdefault(
+            node_id,
+            KnowledgeGraphNodeView(
+                node_id=node_id,
+                node_type=node_type,
+                label=actor_id,
+            ),
+        )
+        return node_id
+
+    for candidate in candidates:
+        candidate_node_id = f"candidate:{candidate.id}"
+        nodes[candidate_node_id] = KnowledgeGraphNodeView(
+            node_id=candidate_node_id,
+            node_type="candidate",
+            label=candidate.claim,
+            metadata={
+                "status": candidate.status.value,
+                "confidence": str(candidate.confidence),
+                "source_count": str(candidate.source_count),
+            },
+        )
+        proposer_node_id = add_actor(candidate.proposer_id)
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=proposer_node_id,
+                target_id=candidate_node_id,
+                label="proposed",
+            )
+        )
+        if candidate.reviewed_by is not None:
+            reviewer_node_id = add_actor(candidate.reviewed_by)
+            edges.append(
+                KnowledgeGraphEdgeView(
+                    source_id=reviewer_node_id,
+                    target_id=candidate_node_id,
+                    label="reviewed",
+                )
+            )
+
+    for item in knowledge_items:
+        knowledge_node_id = f"knowledge:{item.id}"
+        nodes[knowledge_node_id] = KnowledgeGraphNodeView(
+            node_id=knowledge_node_id,
+            node_type="tenant_knowledge",
+            label=item.content,
+            metadata={
+                "kind": item.kind.value,
+                "confidence": str(item.confidence),
+                "source": item.provenance.source,
+            },
+        )
+        actor_node_id = add_actor(item.provenance.actor_id)
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=actor_node_id,
+                target_id=knowledge_node_id,
+                label="attributed",
+            )
+        )
+        source = item.provenance.source
+        if source.startswith("candidate:"):
+            source_candidate_id = source.removeprefix("candidate:")
+            source_node_id = f"candidate:{source_candidate_id}"
+            if source_node_id in nodes:
+                edges.append(
+                    KnowledgeGraphEdgeView(
+                        source_id=source_node_id,
+                        target_id=knowledge_node_id,
+                        label="published",
+                    )
+                )
+                continue
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=f"tenant:{tenant_id}",
+                target_id=knowledge_node_id,
+                label="contains",
+            )
+        )
+
+    return KnowledgeGraphView(
+        nodes=tuple(sorted(nodes.values(), key=lambda node: node.node_id)),
+        edges=tuple(edges),
     )
 
 

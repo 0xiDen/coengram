@@ -48,9 +48,11 @@ import {
   CheckCircle2,
   ClipboardList,
   Copy,
+  Database,
   KeyRound,
   LayoutDashboard,
   LogOut,
+  Network,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -72,7 +74,10 @@ import {
   issueOperatorToken,
   issueToken,
   listOperatorTokens,
+  listPrivateMemoryMetadata,
+  listTenantKnowledge,
   listTokens,
+  loadKnowledgeGraph,
   loadAdminData,
   login,
   logout,
@@ -88,10 +93,13 @@ import type {
   AdminData,
   AdminSession,
   Credential,
+  KnowledgeGraph,
   Operator,
   OperatorTokenRecord,
+  PrivateMemoryMetadata,
   ProvisioningJob,
   RotatedCredential,
+  TenantKnowledgeItem,
   TokenRecord
 } from "./types";
 
@@ -99,6 +107,7 @@ type PageKey =
   | "dashboard"
   | "tenants"
   | "knowledge"
+  | "memory"
   | "identity"
   | "tokens"
   | "operators"
@@ -109,6 +118,7 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: JSX.Element }> = [
   { key: "dashboard", label: "Dashboard", icon: <LayoutDashboard size={18} /> },
   { key: "tenants", label: "Tenants", icon: <Building2 size={18} /> },
   { key: "knowledge", label: "Knowledge", icon: <BrainCircuit size={18} /> },
+  { key: "memory", label: "Memory", icon: <Database size={18} /> },
   { key: "identity", label: "Identity", icon: <Users size={18} /> },
   { key: "tokens", label: "Tokens", icon: <KeyRound size={18} /> },
   { key: "operators", label: "Operators", icon: <ShieldCheck size={18} /> },
@@ -125,6 +135,8 @@ const EMPTY_DATA: AdminData = {
   provisioningJobs: [],
   auditEvents: []
 };
+
+const EMPTY_GRAPH: KnowledgeGraph = { nodes: [], edges: [] };
 
 const OPERATOR_ROLES = [
   "operator_admin",
@@ -335,6 +347,7 @@ function AdminShell({
       {page === "knowledge" ? (
         <KnowledgePage csrf={csrf} data={data} onRefresh={refresh} />
       ) : null}
+      {page === "memory" ? <MemoryPage data={data} /> : null}
       {page === "identity" ? (
         <IdentityPage csrf={csrf} data={data} onRefresh={refresh} onCredential={setCredential} />
       ) : null}
@@ -836,6 +849,157 @@ function KnowledgePage({
         </Panel>
       </GridItem>
     </Grid>
+  );
+}
+
+function MemoryPage({ data }: { data: AdminData }) {
+  const toast = useToast();
+  const [tenantId, setTenantId] = useState(data.tenants[0]?.tenant_id ?? "");
+  const principalsForTenant = useMemo(() => {
+    const tenantPrincipalIds = new Set(
+      data.memberships
+        .filter((membership) => membership.tenant_id === tenantId && membership.active)
+        .map((membership) => membership.principal_id)
+    );
+    const tenantPrincipals = data.principals.filter((principal) =>
+      tenantPrincipalIds.has(principal.principal_id)
+    );
+    return tenantPrincipals.length > 0 ? tenantPrincipals : data.principals;
+  }, [data.memberships, data.principals, tenantId]);
+  const [principalId, setPrincipalId] = useState(
+    principalsForTenant[0]?.principal_id ?? ""
+  );
+  const [privateItems, setPrivateItems] = useState<PrivateMemoryMetadata[]>([]);
+  const [tenantKnowledge, setTenantKnowledge] = useState<TenantKnowledgeItem[]>([]);
+  const [graph, setGraph] = useState<KnowledgeGraph>(EMPTY_GRAPH);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!tenantId && data.tenants[0]) {
+      setTenantId(data.tenants[0].tenant_id);
+    }
+  }, [data.tenants, tenantId]);
+
+  useEffect(() => {
+    if (!principalsForTenant.some((principal) => principal.principal_id === principalId)) {
+      setPrincipalId(principalsForTenant[0]?.principal_id ?? "");
+    }
+  }, [principalId, principalsForTenant]);
+
+  useEffect(() => {
+    if (!tenantId) {
+      setPrivateItems([]);
+      setTenantKnowledge([]);
+      setGraph(EMPTY_GRAPH);
+      return;
+    }
+    let alive = true;
+    setLoading(true);
+    Promise.all([
+      principalId ? listPrivateMemoryMetadata(tenantId, principalId) : Promise.resolve([]),
+      listTenantKnowledge(tenantId),
+      loadKnowledgeGraph(tenantId)
+    ])
+      .then(([nextPrivateItems, nextTenantKnowledge, nextGraph]) => {
+        if (!alive) {
+          return;
+        }
+        setPrivateItems(nextPrivateItems);
+        setTenantKnowledge(nextTenantKnowledge);
+        setGraph(nextGraph);
+      })
+      .catch((exc) => {
+        if (alive) {
+          toast({ status: "error", title: errorMessage(exc) });
+        }
+      })
+      .finally(() => {
+        if (alive) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, [principalId, tenantId, toast]);
+
+  return (
+    <VStack align="stretch" spacing={5}>
+      <Panel title="Support Lens" icon={<Database size={18} />}>
+        <SimpleGrid columns={{ base: 1, md: 2 }} spacing={4}>
+          <FormControl>
+            <FormLabel>Tenant</FormLabel>
+            <Select value={tenantId} onChange={(event) => setTenantId(event.target.value)}>
+              {data.tenants.map((tenant) => (
+                <option key={tenant.tenant_id} value={tenant.tenant_id}>
+                  {tenant.name}
+                </option>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl>
+            <FormLabel>Principal</FormLabel>
+            <Select
+              value={principalId}
+              onChange={(event) => setPrincipalId(event.target.value)}
+            >
+              {principalsForTenant.map((principal) => (
+                <option key={principal.principal_id} value={principal.principal_id}>
+                  {principal.name}
+                </option>
+              ))}
+            </Select>
+          </FormControl>
+        </SimpleGrid>
+      </Panel>
+
+      {loading ? (
+        <Flex align="center" justify="center" minH="320px">
+          <Spinner color="brand.500" />
+        </Flex>
+      ) : (
+        <Grid templateColumns={{ base: "1fr", "2xl": "minmax(0, 1fr) 520px" }} gap={5}>
+          <GridItem>
+            <VStack align="stretch" spacing={5}>
+              <Panel title="Private Memory Metadata" icon={<ShieldCheck size={18} />}>
+                <TableView
+                  headers={["Memory", "Owner", "State", "Kind", "Confidence", "Created"]}
+                  empty="No Private Memory metadata"
+                  rows={privateItems.map((item) => [
+                    <Code key="memory">{shortId(item.memory_id)}</Code>,
+                    <Code key="owner">{shortId(item.owner_principal_id)}</Code>,
+                    <StatusBadge key="state" value={item.state} />,
+                    item.kind ?? "n/a",
+                    item.confidence === null ? "n/a" : `${Math.round(item.confidence * 100)}%`,
+                    formatDate(item.created_at)
+                  ])}
+                />
+              </Panel>
+              <Panel title="Tenant Knowledge" icon={<BrainCircuit size={18} />}>
+                <TableView
+                  headers={["Knowledge", "Kind", "Confidence", "Actor", "Source"]}
+                  empty="No published Tenant Knowledge"
+                  rows={tenantKnowledge.map((item) => [
+                    <Text key="content" noOfLines={2} maxW="560px">
+                      {item.content}
+                    </Text>,
+                    item.kind,
+                    `${Math.round(item.confidence * 100)}%`,
+                    <Code key="actor">{shortId(item.provenance_actor_id)}</Code>,
+                    <Code key="source">{shortId(item.provenance_source)}</Code>
+                  ])}
+                />
+              </Panel>
+            </VStack>
+          </GridItem>
+          <GridItem>
+            <Panel title="Knowledge Graph" icon={<Network size={18} />}>
+              <KnowledgeGraphCanvas graph={graph} />
+            </Panel>
+          </GridItem>
+        </Grid>
+      )}
+    </VStack>
   );
 }
 
@@ -1518,6 +1682,114 @@ function TableView({
   );
 }
 
+function KnowledgeGraphCanvas({ graph }: { graph: KnowledgeGraph }) {
+  const positioned = useMemo(() => {
+    const tenants = graph.nodes.filter((node) => node.node_type === "tenant");
+    const candidates = graph.nodes.filter((node) => node.node_type === "candidate");
+    const knowledge = graph.nodes.filter((node) => node.node_type === "tenant_knowledge");
+    const actors = graph.nodes.filter(
+      (node) => node.node_type === "principal" || node.node_type === "operator"
+    );
+    const positionedNodes: Array<(typeof graph.nodes)[number] & { x: number; y: number }> = [];
+
+    function pushGroup(
+      nodes: typeof graph.nodes,
+      x: number,
+      startY: number,
+      endY: number
+    ) {
+      nodes.forEach((node, index) => {
+        const y =
+          nodes.length === 1
+            ? (startY + endY) / 2
+            : startY + (index / (nodes.length - 1)) * (endY - startY);
+        positionedNodes.push({ ...node, x, y });
+      });
+    }
+
+    pushGroup(tenants, 135, 180, 200);
+    pushGroup(candidates, 410, 70, 150);
+    pushGroup(knowledge, 665, 150, 230);
+    actors.forEach((node, index) => {
+      const x =
+        actors.length === 1 ? 410 : 235 + (index / (actors.length - 1)) * 350;
+      positionedNodes.push({ ...node, x, y: 310 });
+    });
+    return positionedNodes;
+  }, [graph.nodes]);
+  const byId = useMemo(
+    () => new Map(positioned.map((node) => [node.node_id, node])),
+    [positioned]
+  );
+
+  if (graph.nodes.length === 0) {
+    return (
+      <Flex align="center" justify="center" minH="300px" border="1px dashed" borderColor="ink.200" borderRadius="8px">
+        <Text color="ink.500">No graph nodes</Text>
+      </Flex>
+    );
+  }
+
+  return (
+    <Box border="1px solid" borderColor="ink.100" borderRadius="8px" overflow="hidden" bg="ink.50">
+      <svg viewBox="0 0 820 380" role="img" aria-label="Knowledge graph" width="100%" height="360">
+        <rect width="820" height="380" fill="#f5f7f6" />
+        {graph.edges.map((edge) => {
+          const source = byId.get(edge.source_id);
+          const target = byId.get(edge.target_id);
+          if (!source || !target) {
+            return null;
+          }
+          return (
+            <g key={`${edge.source_id}-${edge.target_id}-${edge.label}`}>
+              <line
+                x1={source.x}
+                y1={source.y}
+                x2={target.x}
+                y2={target.y}
+                stroke="#8a9794"
+                strokeWidth="2"
+              />
+            </g>
+          );
+        })}
+        {positioned.map((node) => (
+          <g key={node.node_id}>
+            <circle
+              cx={node.x}
+              cy={node.y}
+              r="34"
+              fill={graphColor(node.node_type)}
+              stroke="#ffffff"
+              strokeWidth="4"
+            />
+            <text
+              x={node.x}
+              y={node.y + 4}
+              fill="#ffffff"
+              fontSize="12"
+              fontWeight="700"
+              textAnchor="middle"
+            >
+              {node.node_type === "tenant_knowledge" ? "knowledge" : node.node_type}
+            </text>
+            <text
+              x={node.x}
+              y={node.y + 55}
+              fill="#111817"
+              fontSize="12"
+              fontWeight="600"
+              textAnchor="middle"
+            >
+              {truncate(node.label, 28)}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </Box>
+  );
+}
+
 function RoleBadges({ roles }: { roles: string[] }) {
   return (
     <HStack wrap="wrap" spacing={1}>
@@ -1606,6 +1878,26 @@ function formatDate(value: string | null) {
 
 function shortId(value: string) {
   return value.length <= 12 ? value : `${value.slice(0, 8)}...`;
+}
+
+function truncate(value: string, maxLength: number) {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
+}
+
+function graphColor(type: string) {
+  if (type === "tenant") {
+    return "#2c7a7b";
+  }
+  if (type === "candidate") {
+    return "#805ad5";
+  }
+  if (type === "tenant_knowledge") {
+    return "#2f855a";
+  }
+  if (type === "operator") {
+    return "#c05621";
+  }
+  return "#2b6cb0";
 }
 
 function activeCount(items: Array<{ active: boolean }>) {

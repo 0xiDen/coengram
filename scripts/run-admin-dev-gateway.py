@@ -21,6 +21,8 @@ def main() -> None:
     tokens = TokenService(store)
     control = ControlModule(store, tokens)
     control.create_tenant("tenant-a", "Product A")
+    control.create_principal("user-alice", "Alice", PrincipalKind.USER.value)
+    control.grant_membership("tenant-a", "user-alice", "tenant_member")
     control.create_operator(
         "operator-dev",
         "Dev Operator",
@@ -40,18 +42,16 @@ def main() -> None:
         "operator-dev",
         lifetime=timedelta(days=7),
     )
-    memory = MemoryModule(
-        InMemoryTenantMemoryRouter(["tenant-a"]),
-        InMemoryGovernanceStore(),
-    )
-    asyncio.run(_seed_candidate(memory))
+    router = InMemoryTenantMemoryRouter(["tenant-a"])
+    memory = MemoryModule(router, InMemoryGovernanceStore())
+    asyncio.run(_seed_memory(memory, router))
     app = create_http_app(memory, tokens, control=control)
     print("Admin dev Operator Access Token:", flush=True)
     print(credential.access_token, flush=True)
     uvicorn.run(app, host="127.0.0.1", port=8080, access_log=False)
 
 
-async def _seed_candidate(memory: MemoryModule) -> None:
+async def _seed_memory(memory: MemoryModule, router: InMemoryTenantMemoryRouter) -> None:
     session = TenantSession(
         tenant_id="tenant-a",
         actor_id="user-alice",
@@ -74,6 +74,12 @@ async def _seed_candidate(memory: MemoryModule) -> None:
             confidence=0.91,
             idempotency_key="admin-dev-knowledge-candidate",
         ),
+    )
+    await router.for_tenant("tenant-a").publish_tenant_knowledge(
+        "admin-dev-published-knowledge",
+        "Product A keeps deployment rollback notes in Tenant Knowledge after review.",
+        0.88,
+        "user-curator",
     )
 
 

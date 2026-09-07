@@ -108,6 +108,46 @@ export type KnowledgeCandidate = {
   review_rationale: string | null;
 };
 
+export type PrivateMemoryMetadata = {
+  memory_id: string;
+  owner_principal_id: string;
+  state: string;
+  operation_id: string | null;
+  mutation_state: string;
+  kind: string | null;
+  confidence: number | null;
+  created_at: string;
+  supersedes_id: string | null;
+};
+
+export type TenantKnowledgeItem = {
+  memory_id: string;
+  content: string;
+  kind: string;
+  confidence: number;
+  provenance_actor_id: string;
+  provenance_source: string;
+  created_at: string;
+};
+
+export type KnowledgeGraphNode = {
+  node_id: string;
+  node_type: string;
+  label: string;
+  metadata: Record<string, string>;
+};
+
+export type KnowledgeGraphEdge = {
+  source_id: string;
+  target_id: string;
+  label: string;
+};
+
+export type KnowledgeGraph = {
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+};
+
 export type AuditEvent = {
   event_id: string;
   operator_id: string;
