@@ -659,8 +659,10 @@ class InMemoryControlStore:
             ):
                 self._channel_bindings[key] = replace(binding, active=False)
         self._revoke_matching_tokens(
-            lambda record: record.session.actor_id == principal_id
-            or record.session.subject_user_id == principal_id,
+            lambda record: (
+                record.session.actor_id == principal_id
+                or record.session.subject_user_id == principal_id
+            ),
             disabled_at,
         )
         return disabled
@@ -692,8 +694,10 @@ class InMemoryControlStore:
         self._memberships[key] = updated
         if updated.roles != current.roles or updated.active != current.active:
             self._revoke_matching_tokens(
-                lambda token: token.session.tenant_id == record.tenant_id
-                and token.session.actor_id == record.principal_id,
+                lambda token: (
+                    token.session.tenant_id == record.tenant_id
+                    and token.session.actor_id == record.principal_id
+                ),
                 changed_at,
             )
         return updated
@@ -721,10 +725,12 @@ class InMemoryControlStore:
             if binding.delegation_id in affected_delegations:
                 self._channel_bindings[binding_key] = replace(binding, active=False)
         self._revoke_matching_tokens(
-            lambda record: record.session.tenant_id == tenant_id
-            and (
-                record.session.actor_id == principal_id
-                or record.session.subject_user_id == principal_id
+            lambda record: (
+                record.session.tenant_id == tenant_id
+                and (
+                    record.session.actor_id == principal_id
+                    or record.session.subject_user_id == principal_id
+                )
             ),
             disabled_at,
         )
@@ -744,8 +750,9 @@ class InMemoryControlStore:
         updated = replace(current, roles=remaining)
         self._memberships[(tenant_id, principal_id)] = updated
         self._revoke_matching_tokens(
-            lambda record: record.session.tenant_id == tenant_id
-            and record.session.actor_id == principal_id,
+            lambda record: (
+                record.session.tenant_id == tenant_id and record.session.actor_id == principal_id
+            ),
             revoked_at,
         )
         return updated
