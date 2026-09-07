@@ -33,4 +33,3 @@ Operator Service using Control Store polling and claiming.
 ## Comments
 
 No comments yet.
-

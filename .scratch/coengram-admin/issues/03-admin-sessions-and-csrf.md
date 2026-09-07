@@ -25,4 +25,3 @@ server-issued CSRF tokens for mutating requests.
 ## Comments
 
 No comments yet.
-

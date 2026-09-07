@@ -112,4 +112,3 @@ Knowledge graph shape.
 - Observability dashboards embedded in the admin panel.
 - Cleanup for active Tenants; active Tenant removal stays with the existing
   decommissioning model.
-
