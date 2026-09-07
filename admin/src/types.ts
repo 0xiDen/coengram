@@ -93,6 +93,18 @@ export type ProvisioningJob = {
   updated_at: string;
 };
 
+export type ProvisioningPlan = {
+  tenant_id: string;
+  name: string;
+  manifest_fingerprint: string;
+  database_name: string;
+  database_role: string;
+  neo4j_service_name: string;
+  existing_tenant_active: boolean | null;
+  cleanup_eligible: boolean;
+  warnings: string[];
+};
+
 export type KnowledgeCandidate = {
   id: string;
   tenant_id?: string;
@@ -100,8 +112,8 @@ export type KnowledgeCandidate = {
   confidence: number;
   proposer_id: string;
   source_count: number;
-  duplicate_memory_ids: string[];
-  conflicting_memory_ids: string[];
+  duplicate_count: number;
+  conflict_count: number;
   status: string;
   created_at: string;
   reviewed_by: string | null;
@@ -162,7 +174,31 @@ export type AuditEvent = {
   created_at: string;
 };
 
+export type Dashboard = {
+  counts: {
+    tenants: number;
+    active_tenants: number;
+    operators: number;
+    active_operators: number;
+    principals: number;
+    active_principals: number;
+    memberships: number;
+    active_memberships: number;
+    pending_knowledge_candidates: number;
+  };
+  token_warnings: {
+    expiring_principal_tokens: number;
+    unused_principal_tokens: number;
+    expiring_operator_tokens: number;
+    unused_operator_tokens: number;
+  };
+  failed_provisioning_jobs: ProvisioningJob[];
+  stalled_provisioning_jobs: ProvisioningJob[];
+  recent_audit_events: AuditEvent[];
+};
+
 export type AdminData = {
+  dashboard: Dashboard | null;
   tenants: Tenant[];
   operators: Operator[];
   principals: Principal[];

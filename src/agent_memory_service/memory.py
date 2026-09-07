@@ -201,8 +201,7 @@ class MemoryModule:
 
         governance = self._require_governance()
         return tuple(
-            candidate_view(candidate)
-            for candidate in await governance.list_candidates(tenant_id)
+            candidate_view(candidate) for candidate in await governance.list_candidates(tenant_id)
         )
 
     async def review_operator_knowledge(
@@ -234,8 +233,7 @@ class MemoryModule:
                 owner_principal_id,
             )
             return tuple(
-                inspection.model_copy(update={"content": None})
-                for inspection in inspections
+                inspection.model_copy(update={"content": None}) for inspection in inspections
             )
         items = await self._router.for_tenant(tenant_id).list_private(owner_principal_id)
         return tuple(

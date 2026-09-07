@@ -16,8 +16,10 @@ from agent_memory_service.control import (
     MembershipRecord,
     OperatorRecord,
     PrincipalRecord,
+    is_token_unused_for_30_days,
 )
 from agent_memory_service.governance import (
+    CandidateStatus,
     KnowledgeCandidateView,
     ReviewDecision,
     ReviewKnowledge,
@@ -32,6 +34,7 @@ from agent_memory_service.operator_auth import (
     OperatorTokenRecord,
 )
 from agent_memory_service.operator_provisioning import (
+    ProvisioningJobState,
     ProvisioningJobView,
     provisioning_job_view,
 )
@@ -56,13 +59,17 @@ PROVISIONING_VISIBLE_ROLES = frozenset(
     {"tenant_provisioner", "tenant_support", "audit_viewer", "operator_admin"}
 )
 OPERATOR_ADMIN_ROLES = frozenset({"operator_admin"})
-IDENTITY_VISIBLE_ROLES = frozenset(
-    {"identity_admin", "tenant_support", "token_admin", "audit_viewer", "operator_admin"}
+OPERATOR_TOKEN_VISIBLE_ROLES = frozenset({"token_admin", "operator_admin"})
+OPERATOR_TOKEN_MUTATION_ROLES = frozenset({"token_admin", "operator_admin"})
+IDENTITY_VISIBLE_ROLES = frozenset({"identity_admin", "tenant_support", "operator_admin"})
+TOKEN_VISIBLE_ROLES = frozenset(
+    {"token_admin", "identity_admin", "tenant_support", "operator_admin"}
 )
-TOKEN_VISIBLE_ROLES = frozenset({"token_admin", "audit_viewer", "operator_admin"})
-TOKEN_MUTATION_ROLES = frozenset({"token_admin", "operator_admin"})
+TOKEN_MUTATION_ROLES = frozenset({"token_admin", "identity_admin", "operator_admin"})
 KNOWLEDGE_ROLES = frozenset({"knowledge_admin", "operator_admin"})
 SUPPORT_LENS_ROLES = frozenset({"tenant_support", "knowledge_admin", "operator_admin"})
+TOKEN_EXPIRY_WARNING_WINDOW = timedelta(days=7)
+PROVISIONING_STALE_AFTER = timedelta(minutes=5)
 
 
 class AdminLoginBody(BaseModel):
@@ -279,10 +286,58 @@ class ProvisioningJobListView(BaseModel):
     jobs: tuple[ProvisioningJobView, ...]
 
 
+class ProvisioningPlanBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    manifest: TenantManifest
+
+
+class ProvisioningPlanView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    name: str
+    manifest_fingerprint: str
+    database_name: str
+    database_role: str
+    neo4j_service_name: str
+    existing_tenant_active: bool | None
+    cleanup_eligible: bool
+    warnings: tuple[str, ...] = ()
+
+
+class RetryProvisioningJobBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=4_000)
+
+
+class CleanupProvisioningJobBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=200)
+
+
+class AdminKnowledgeCandidateView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    claim: str
+    confidence: float
+    proposer_id: str
+    source_count: int
+    duplicate_count: int
+    conflict_count: int
+    status: CandidateStatus
+    created_at: datetime
+    reviewed_by: str | None = None
+    review_rationale: str | None = None
+
+
 class KnowledgeCandidateListView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    candidates: tuple[KnowledgeCandidateView, ...]
+    candidates: tuple[AdminKnowledgeCandidateView, ...]
 
 
 class ReviewKnowledgeCandidateBody(BaseModel):
@@ -361,6 +416,39 @@ class OperatorAuditEventListView(BaseModel):
     events: tuple[OperatorAuditEventView, ...]
 
 
+class DashboardCountsView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenants: int
+    active_tenants: int
+    operators: int
+    active_operators: int
+    principals: int
+    active_principals: int
+    memberships: int
+    active_memberships: int
+    pending_knowledge_candidates: int
+
+
+class DashboardTokenWarningsView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    expiring_principal_tokens: int
+    unused_principal_tokens: int
+    expiring_operator_tokens: int
+    unused_operator_tokens: int
+
+
+class DashboardView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    counts: DashboardCountsView
+    token_warnings: DashboardTokenWarningsView
+    failed_provisioning_jobs: tuple[ProvisioningJobView, ...]
+    stalled_provisioning_jobs: tuple[ProvisioningJobView, ...]
+    recent_audit_events: tuple[OperatorAuditEventView, ...]
+
+
 def mount_admin_routes(
     app: FastAPI,
     control: ControlModule,
@@ -374,20 +462,42 @@ def mount_admin_routes(
         response_model=AdminSessionCreated,
         status_code=status.HTTP_201_CREATED,
     )
-    async def create_admin_session(body: AdminLoginBody, response: Response) -> AdminSessionCreated:
+    async def create_admin_session(
+        body: AdminLoginBody,
+        request: Request,
+        response: Response,
+    ) -> AdminSessionCreated:
         try:
             created = control.create_admin_session(body.access_token)
         except AuthenticationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
             ) from exc
-        _set_session_cookie(response, created.session_token)
+        _set_session_cookie(
+            response,
+            created.session_token,
+            secure=_admin_cookie_secure(request),
+        )
         return _created_session_document(created)
 
     @app.get("/api/v1/admin/session", response_model=AdminSessionView)
     async def current_admin_session(request: Request) -> AdminSessionView:
         session = _authenticate_request(control, request, require_csrf=False)
         return _session_view(session)
+
+    @app.get("/api/v1/admin/dashboard", response_model=DashboardView)
+    async def admin_dashboard(request: Request) -> DashboardView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(
+            session,
+            TENANT_VISIBLE_ROLES
+            | IDENTITY_VISIBLE_ROLES
+            | TOKEN_VISIBLE_ROLES
+            | PROVISIONING_VISIBLE_ROLES
+            | KNOWLEDGE_ROLES
+            | AUDIT_VISIBLE_ROLES,
+        )
+        return await _dashboard_view(control, memory)
 
     @app.get("/api/v1/admin/tenants", response_model=TenantListView)
     async def list_admin_tenants(request: Request) -> TenantListView:
@@ -494,7 +604,7 @@ def mount_admin_routes(
         request: Request,
     ) -> OperatorTokenListView:
         session = _authenticate_request(control, request, require_csrf=False)
-        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        _require_operator_token_visibility(session, operator_id)
         try:
             tokens = control.list_operator_tokens(operator_id)
         except ControlNotFound as exc:
@@ -520,7 +630,7 @@ def mount_admin_routes(
             csrf_token=csrf_token,
             require_csrf=True,
         )
-        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
         try:
             credential = control.issue_operator_access_token(
                 operator_id,
@@ -554,7 +664,7 @@ def mount_admin_routes(
             csrf_token=csrf_token,
             require_csrf=True,
         )
-        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
         try:
             rotated = control.rotate_operator_access_token(
                 token_id,
@@ -590,7 +700,7 @@ def mount_admin_routes(
             csrf_token=csrf_token,
             require_csrf=True,
         )
-        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
         control.revoke_operator_access_token(token_id)
         control.record_operator_audit_event(
             session,
@@ -804,11 +914,13 @@ def mount_admin_routes(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=str(exc),
             ) from exc
-        return KnowledgeCandidateListView(candidates=candidates)
+        return KnowledgeCandidateListView(
+            candidates=tuple(_admin_knowledge_candidate_view(candidate) for candidate in candidates)
+        )
 
     @app.post(
         "/api/v1/admin/tenants/{tenant_id}/knowledge-candidates/{candidate_id}/reviews",
-        response_model=KnowledgeCandidateView,
+        response_model=AdminKnowledgeCandidateView,
     )
     async def review_admin_knowledge_candidate(
         tenant_id: str,
@@ -816,7 +928,7 @@ def mount_admin_routes(
         body: ReviewKnowledgeCandidateBody,
         request: Request,
         csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
-    ) -> KnowledgeCandidateView:
+    ) -> AdminKnowledgeCandidateView:
         session = _authenticate_request(
             control,
             request,
@@ -851,7 +963,7 @@ def mount_admin_routes(
                 "status": candidate.status.value,
             },
         )
-        return candidate
+        return _admin_knowledge_candidate_view(candidate)
 
     @app.get(
         "/api/v1/admin/tenants/{tenant_id}/memory/private",
@@ -947,6 +1059,21 @@ def mount_admin_routes(
         )
         return graph
 
+    @app.post("/api/v1/admin/provisioning-plan", response_model=ProvisioningPlanView)
+    async def plan_admin_provisioning_job(
+        body: ProvisioningPlanBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningPlanView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        return _provisioning_plan_view(control, body.manifest)
+
     @app.post(
         "/api/v1/admin/provisioning-jobs",
         response_model=ProvisioningJobView,
@@ -1000,6 +1127,60 @@ def mount_admin_routes(
         _require_roles(session, PROVISIONING_MUTATION_ROLES)
         try:
             job = control.cancel_provisioning_job(session, job_id)
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs/{job_id}/retry",
+        response_model=ProvisioningJobView,
+    )
+    async def retry_admin_provisioning_job(
+        job_id: str,
+        body: RetryProvisioningJobBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.retry_provisioning_job(session, job_id)
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs/{job_id}/cleanup",
+        response_model=ProvisioningJobView,
+    )
+    async def request_admin_provisioning_cleanup(
+        job_id: str,
+        body: CleanupProvisioningJobBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.request_provisioning_cleanup(
+                session,
+                job_id,
+                confirmation=body.confirmation,
+            )
         except ControlNotFound as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1067,13 +1248,154 @@ def _require_memory(memory: MemoryModule | None) -> MemoryModule:
     return memory
 
 
-def _set_session_cookie(response: Response, session_token: str) -> None:
+async def _dashboard_view(
+    control: ControlModule,
+    memory: MemoryModule | None,
+) -> DashboardView:
+    checked_at = datetime.now(UTC)
+    tenants = control.list_tenants()
+    operators = control.list_operators()
+    principals = control.list_principals()
+    memberships = tuple(
+        membership
+        for tenant in tenants
+        for membership in control.list_memberships(tenant.tenant_id)
+    )
+    principal_tokens = tuple(
+        token
+        for membership in memberships
+        for token in control.list_tokens(membership.tenant_id, membership.principal_id)
+    )
+    operator_tokens = tuple(
+        token
+        for operator in operators
+        for token in control.list_operator_tokens(operator.operator_id)
+    )
+    jobs = control.list_provisioning_jobs()
+    pending_knowledge_candidates = 0
+    if memory is not None:
+        for tenant in tenants:
+            try:
+                candidates = await memory.list_operator_knowledge_candidates(tenant.tenant_id)
+            except RuntimeError:
+                continue
+            pending_knowledge_candidates += sum(
+                1 for candidate in candidates if candidate.status is CandidateStatus.SUBMITTED
+            )
+
+    return DashboardView(
+        counts=DashboardCountsView(
+            tenants=len(tenants),
+            active_tenants=sum(1 for tenant in tenants if tenant.active),
+            operators=len(operators),
+            active_operators=sum(1 for operator in operators if operator.active),
+            principals=len(principals),
+            active_principals=sum(1 for principal in principals if principal.active),
+            memberships=len(memberships),
+            active_memberships=sum(1 for membership in memberships if membership.active),
+            pending_knowledge_candidates=pending_knowledge_candidates,
+        ),
+        token_warnings=DashboardTokenWarningsView(
+            expiring_principal_tokens=sum(
+                1
+                for token in principal_tokens
+                if _active_principal_token(token, checked_at)
+                and token.expires_at <= checked_at + TOKEN_EXPIRY_WARNING_WINDOW
+            ),
+            unused_principal_tokens=sum(
+                1
+                for token in principal_tokens
+                if is_token_unused_for_30_days(token, now=checked_at)
+            ),
+            expiring_operator_tokens=sum(
+                1
+                for token in operator_tokens
+                if _active_operator_token(token, checked_at)
+                and token.expires_at <= checked_at + TOKEN_EXPIRY_WARNING_WINDOW
+            ),
+            unused_operator_tokens=sum(
+                1
+                for token in operator_tokens
+                if _operator_token_unused_for_30_days(token, now=checked_at)
+            ),
+        ),
+        failed_provisioning_jobs=tuple(
+            provisioning_job_view(job) for job in jobs if job.state is ProvisioningJobState.FAILED
+        ),
+        stalled_provisioning_jobs=tuple(
+            provisioning_job_view(job)
+            for job in jobs
+            if job.state is ProvisioningJobState.RUNNING
+            and (
+                job.heartbeat_at is None
+                or job.heartbeat_at <= checked_at - PROVISIONING_STALE_AFTER
+            )
+        ),
+        recent_audit_events=tuple(
+            operator_audit_event_view(event)
+            for event in control.list_operator_audit_events(limit=8)
+        ),
+    )
+
+
+def _active_principal_token(record: TokenRecord, checked_at: datetime) -> bool:
+    return record.revoked_at is None and record.expires_at > checked_at
+
+
+def _active_operator_token(record: OperatorTokenRecord, checked_at: datetime) -> bool:
+    return record.revoked_at is None and record.expires_at > checked_at
+
+
+def _operator_token_unused_for_30_days(
+    record: OperatorTokenRecord,
+    *,
+    now: datetime,
+) -> bool:
+    if now.tzinfo is None:
+        raise ValueError("Token inventory time must be timezone-aware")
+    last_activity = record.last_used_at or record.issued_at
+    return _active_operator_token(record, now) and last_activity <= now - timedelta(days=30)
+
+
+def _provisioning_plan_view(
+    control: ControlModule,
+    manifest: TenantManifest,
+) -> ProvisioningPlanView:
+    existing_tenant = next(
+        (tenant for tenant in control.list_tenants() if tenant.tenant_id == manifest.tenant_id),
+        None,
+    )
+    warnings: list[str] = []
+    if existing_tenant is not None and existing_tenant.active:
+        warnings.append("Active Tenant already exists; cleanup is not available.")
+    elif existing_tenant is not None:
+        warnings.append("Inactive Tenant record exists; verify cleanup before retrying.")
+    return ProvisioningPlanView(
+        tenant_id=manifest.tenant_id,
+        name=manifest.name,
+        manifest_fingerprint=manifest.fingerprint,
+        database_name=manifest.database_name,
+        database_role=manifest.database_role,
+        neo4j_service_name=manifest.neo4j_service_name,
+        existing_tenant_active=None if existing_tenant is None else existing_tenant.active,
+        cleanup_eligible=existing_tenant is None or not existing_tenant.active,
+        warnings=tuple(warnings),
+    )
+
+
+def _admin_cookie_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    first_forwarded_proto = forwarded_proto.split(",", 1)[0].strip().lower()
+    return request.url.scheme == "https" or first_forwarded_proto == "https"
+
+
+def _set_session_cookie(response: Response, session_token: str, *, secure: bool) -> None:
     response.set_cookie(
         ADMIN_SESSION_COOKIE,
         session_token,
         max_age=ADMIN_COOKIE_MAX_AGE_SECONDS,
         httponly=True,
-        secure=False,
+        secure=secure,
         samesite="strict",
         path="/api/v1/admin",
     )
@@ -1124,6 +1446,24 @@ def _membership_view(membership: MembershipRecord) -> MembershipView:
         principal_id=membership.principal_id,
         roles=tuple(sorted(membership.roles)),
         active=membership.active,
+    )
+
+
+def _admin_knowledge_candidate_view(
+    candidate: KnowledgeCandidateView,
+) -> AdminKnowledgeCandidateView:
+    return AdminKnowledgeCandidateView(
+        id=candidate.id,
+        claim=candidate.claim,
+        confidence=candidate.confidence,
+        proposer_id=candidate.proposer_id,
+        source_count=candidate.source_count,
+        duplicate_count=len(candidate.duplicate_memory_ids),
+        conflict_count=len(candidate.conflicting_memory_ids),
+        status=candidate.status,
+        created_at=candidate.created_at,
+        reviewed_by=candidate.reviewed_by,
+        review_rationale=candidate.review_rationale,
     )
 
 
@@ -1296,6 +1636,12 @@ def _operator_token_record_view(record: OperatorTokenRecord) -> OperatorTokenRec
 def _require_roles(session: OperatorSession, allowed: frozenset[str]) -> None:
     if not session.roles.intersection(allowed):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def _require_operator_token_visibility(session: OperatorSession, operator_id: str) -> None:
+    if session.operator_id == operator_id:
+        return
+    _require_roles(session, OPERATOR_TOKEN_VISIBLE_ROLES)
 
 
 def _require_tenant(control: ControlModule, tenant_id: str) -> None:

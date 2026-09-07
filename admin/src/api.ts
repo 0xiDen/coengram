@@ -3,6 +3,7 @@ import type {
   AdminSession,
   AuditEvent,
   Credential,
+  Dashboard,
   KnowledgeCandidate,
   KnowledgeGraph,
   Membership,
@@ -11,6 +12,7 @@ import type {
   Principal,
   PrivateMemoryMetadata,
   ProvisioningJob,
+  ProvisioningPlan,
   RotatedCredential,
   Tenant,
   TenantKnowledgeItem,
@@ -101,7 +103,8 @@ export async function logout(csrf: string | null): Promise<void> {
 }
 
 export async function loadAdminData(): Promise<AdminData> {
-  const [tenants, operators, principals, provisioningJobs, auditEvents] = await Promise.all([
+  const [dashboard, tenants, operators, principals, provisioningJobs, auditEvents] = await Promise.all([
+    optional<Dashboard | null>(request<Dashboard>("/dashboard"), null),
     optional(request<{ tenants: Tenant[] }>("/tenants"), { tenants: [] }),
     optional(request<{ operators: Operator[] }>("/operators"), { operators: [] }),
     optional(request<{ principals: Principal[]; memberships: Membership[] }>("/principals"), {
@@ -127,6 +130,7 @@ export async function loadAdminData(): Promise<AdminData> {
   );
 
   return {
+    dashboard,
     tenants: tenants.tenants,
     operators: operators.operators,
     principals: principals.principals,
@@ -288,6 +292,17 @@ export async function createProvisioningJob(
   return request<ProvisioningJob>("/provisioning-jobs", { method: "POST", csrf, body });
 }
 
+export async function planProvisioningManifest(
+  csrf: string | null,
+  manifest: unknown
+): Promise<ProvisioningPlan> {
+  return request<ProvisioningPlan>("/provisioning-plan", {
+    method: "POST",
+    csrf,
+    body: { manifest }
+  });
+}
+
 export async function cancelProvisioningJob(
   csrf: string | null,
   jobId: string
@@ -295,5 +310,29 @@ export async function cancelProvisioningJob(
   return request<ProvisioningJob>(`/provisioning-jobs/${jobId}/cancel`, {
     method: "POST",
     csrf
+  });
+}
+
+export async function retryProvisioningJob(
+  csrf: string | null,
+  jobId: string,
+  reason: string
+): Promise<ProvisioningJob> {
+  return request<ProvisioningJob>(`/provisioning-jobs/${jobId}/retry`, {
+    method: "POST",
+    csrf,
+    body: { reason }
+  });
+}
+
+export async function requestProvisioningCleanup(
+  csrf: string | null,
+  jobId: string,
+  confirmation: string
+): Promise<ProvisioningJob> {
+  return request<ProvisioningJob>(`/provisioning-jobs/${jobId}/cleanup`, {
+    method: "POST",
+    csrf,
+    body: { confirmation }
   });
 }

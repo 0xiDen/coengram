@@ -81,9 +81,12 @@ import {
   loadAdminData,
   login,
   logout,
+  planProvisioningManifest,
   reviewKnowledgeCandidate,
+  requestProvisioningCleanup,
   revokeOperatorToken,
   revokeToken,
+  retryProvisioningJob,
   rotateOperatorToken,
   rotateToken,
   storeCsrf,
@@ -98,12 +101,13 @@ import type {
   OperatorTokenRecord,
   PrivateMemoryMetadata,
   ProvisioningJob,
+  ProvisioningPlan,
   RotatedCredential,
   TenantKnowledgeItem,
   TokenRecord
 } from "./types";
 
-type PageKey =
+export type PageKey =
   | "dashboard"
   | "tenants"
   | "knowledge"
@@ -127,6 +131,7 @@ const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: JSX.Element }> = [
 ];
 
 const EMPTY_DATA: AdminData = {
+  dashboard: null,
   tenants: [],
   operators: [],
   principals: [],
@@ -149,6 +154,34 @@ const OPERATOR_ROLES = [
 ];
 
 const TENANT_ROLES = ["tenant_administrator", "knowledge_curator", "tenant_member"];
+
+const PAGE_ROLES: Record<PageKey, string[] | null> = {
+  dashboard: null,
+  tenants: [
+    "tenant_provisioner",
+    "tenant_support",
+    "identity_admin",
+    "knowledge_admin",
+    "audit_viewer",
+    "operator_admin"
+  ],
+  knowledge: ["knowledge_admin", "operator_admin"],
+  memory: ["tenant_support", "knowledge_admin", "operator_admin"],
+  identity: ["identity_admin", "tenant_support", "operator_admin"],
+  tokens: ["token_admin", "identity_admin", "tenant_support", "operator_admin"],
+  operators: ["operator_admin"],
+  provisioning: ["tenant_provisioner", "tenant_support", "audit_viewer", "operator_admin"],
+  audit: ["audit_viewer", "operator_admin"]
+};
+
+export function canAccessPage(page: PageKey, roles: string[]): boolean {
+  const allowed = PAGE_ROLES[page];
+  return allowed === null || allowed.some((role) => roles.includes(role));
+}
+
+export function visibleNavItems(roles: string[]): typeof NAV_ITEMS {
+  return NAV_ITEMS.filter((item) => canAccessPage(item.key, roles));
+}
 
 export default function App() {
   const [session, setSession] = useState<AdminSession | null>(null);
@@ -306,6 +339,7 @@ function AdminShell({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [credential, setCredential] = useState<Credential | RotatedCredential | null>(null);
+  const navItems = useMemo(() => visibleNavItems(session.roles), [session.roles]);
 
   async function refresh() {
     setLoading(true);
@@ -322,6 +356,12 @@ function AdminShell({
   useEffect(() => {
     void refresh();
   }, []);
+
+  useEffect(() => {
+    if (!canAccessPage(page, session.roles)) {
+      setPage("dashboard");
+    }
+  }, [page, session.roles]);
 
   async function signOut() {
     try {
@@ -366,7 +406,7 @@ function AdminShell({
 
   return (
     <Flex minH="100vh" bg="ink.50">
-      <Sidebar page={page} onPageChange={setPage} />
+      <Sidebar page={page} items={navItems} onPageChange={setPage} />
       <Box flex="1" minW={0}>
         <Flex
           as="header"
@@ -387,7 +427,7 @@ function AdminShell({
             maxW="190px"
             onChange={(event) => setPage(event.target.value as PageKey)}
           >
-            {NAV_ITEMS.map((item) => (
+            {navItems.map((item) => (
               <option key={item.key} value={item.key}>
                 {item.label}
               </option>
@@ -422,7 +462,15 @@ function AdminShell({
   );
 }
 
-function Sidebar({ page, onPageChange }: { page: PageKey; onPageChange: (page: PageKey) => void }) {
+function Sidebar({
+  page,
+  items,
+  onPageChange
+}: {
+  page: PageKey;
+  items: typeof NAV_ITEMS;
+  onPageChange: (page: PageKey) => void;
+}) {
   return (
     <VStack
       display={{ base: "none", lg: "flex" }}
@@ -450,7 +498,7 @@ function Sidebar({ page, onPageChange }: { page: PageKey; onPageChange: (page: P
       </HStack>
       <Divider borderColor="whiteAlpha.200" />
       <VStack align="stretch" spacing={1}>
-        {NAV_ITEMS.map((item) => {
+        {items.map((item) => {
           const selected = page === item.key;
           return (
             <Button
@@ -501,22 +549,50 @@ function PageBoundary({
 }
 
 function DashboardPage({ data }: { data: AdminData }) {
-  const expiringOperators = data.operators.filter((operator) => operator.active).length;
+  const dashboard = data.dashboard;
+  const activeOperators = dashboard?.counts.active_operators ?? activeCount(data.operators);
   const queue = data.provisioningJobs.filter((job) =>
     ["queued", "running", "failed", "cancel_requested"].includes(job.state)
   );
-  const pendingCandidates = data.knowledgeCandidates.filter(
-    (candidate) => candidate.status === "submitted"
-  ).length;
+  const pendingCandidates =
+    dashboard?.counts.pending_knowledge_candidates ??
+    data.knowledgeCandidates.filter((candidate) => candidate.status === "submitted").length;
+  const failedJobs = dashboard?.failed_provisioning_jobs.length ?? 0;
+  const stalledJobs = dashboard?.stalled_provisioning_jobs.length ?? 0;
+  const warningTotal = dashboard
+    ? dashboard.token_warnings.expiring_principal_tokens +
+      dashboard.token_warnings.unused_principal_tokens +
+      dashboard.token_warnings.expiring_operator_tokens +
+      dashboard.token_warnings.unused_operator_tokens
+    : 0;
 
   return (
     <VStack align="stretch" spacing={6}>
       <SimpleGrid columns={{ base: 1, md: 2, xl: 4 }} spacing={4}>
-        <StatCard label="Tenants" value={data.tenants.length} helper={`${activeCount(data.tenants)} active`} />
-        <StatCard label="Operators" value={data.operators.length} helper={`${expiringOperators} active`} />
-        <StatCard label="Principals" value={data.principals.length} helper={`${activeCount(data.principals)} active`} />
+        <StatCard
+          label="Tenants"
+          value={dashboard?.counts.tenants ?? data.tenants.length}
+          helper={`${dashboard?.counts.active_tenants ?? activeCount(data.tenants)} active`}
+        />
+        <StatCard
+          label="Operators"
+          value={dashboard?.counts.operators ?? data.operators.length}
+          helper={`${activeOperators} active`}
+        />
+        <StatCard
+          label="Principals"
+          value={dashboard?.counts.principals ?? data.principals.length}
+          helper={`${dashboard?.counts.active_principals ?? activeCount(data.principals)} active`}
+        />
         <StatCard label="Knowledge" value={pendingCandidates} helper="pending review" />
       </SimpleGrid>
+      {dashboard ? (
+        <SimpleGrid columns={{ base: 1, md: 3 }} spacing={4}>
+          <StatCard label="Token warnings" value={warningTotal} helper="expiring or unused" />
+          <StatCard label="Failed jobs" value={failedJobs} helper="need review" />
+          <StatCard label="Stalled jobs" value={stalledJobs} helper="heartbeat overdue" />
+        </SimpleGrid>
+      ) : null}
       <Panel title="Action Queue" icon={<ClipboardList size={18} />}>
         <TableView
           headers={["Tenant", "State", "Attempt", "Updated"]}
@@ -563,6 +639,40 @@ function TenantsPage({
   const [adminName, setAdminName] = useState("");
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [busy, setBusy] = useState(false);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [plan, setPlan] = useState<ProvisioningPlan | null>(null);
+
+  function manifestDocument() {
+    return {
+      version: 1,
+      tenant_id: tenantId,
+      name,
+      principals: [
+        {
+          principal_id: adminPrincipalId,
+          name: adminName,
+          kind: "user"
+        }
+      ],
+      memberships: [
+        {
+          principal_id: adminPrincipalId,
+          roles: ["tenant_administrator"]
+        }
+      ]
+    };
+  }
+
+  async function previewPlan() {
+    setPlanBusy(true);
+    try {
+      setPlan(await planProvisioningManifest(csrf, manifestDocument()));
+    } catch (exc) {
+      toast({ status: "error", title: errorMessage(exc) });
+    } finally {
+      setPlanBusy(false);
+    }
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -570,24 +680,7 @@ function TenantsPage({
     try {
       const job = await createProvisioningJob(csrf, {
         idempotency_key: idempotencyKey || `${tenantId}-initial`,
-        manifest: {
-          version: 1,
-          tenant_id: tenantId,
-          name,
-          principals: [
-            {
-              principal_id: adminPrincipalId,
-              name: adminName,
-              kind: "user"
-            }
-          ],
-          memberships: [
-            {
-              principal_id: adminPrincipalId,
-              roles: ["tenant_administrator"]
-            }
-          ]
-        }
+        manifest: manifestDocument()
       });
       onCredential(null);
       toast({ status: "success", title: `Provisioning Job ${shortId(job.job_id)} queued` });
@@ -596,6 +689,7 @@ function TenantsPage({
       setAdminPrincipalId("");
       setAdminName("");
       setIdempotencyKey("");
+      setPlan(null);
       await onRefresh();
     } catch (exc) {
       toast({ status: "error", title: errorMessage(exc) });
@@ -644,9 +738,31 @@ function TenantsPage({
               <FormLabel>Idempotency Key</FormLabel>
               <Input value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} />
             </FormControl>
-            <Button type="submit" isLoading={busy} leftIcon={<Plus size={16} />}>
-              Queue Job
-            </Button>
+            {plan ? (
+              <Alert status={plan.warnings.length ? "warning" : "success"} borderRadius="8px">
+                <AlertIcon />
+                <Box minW={0}>
+                  <Text fontWeight={700}>{shortId(plan.manifest_fingerprint)}</Text>
+                  <Text fontSize="sm">
+                    {plan.database_name} / {plan.neo4j_service_name}
+                  </Text>
+                </Box>
+              </Alert>
+            ) : null}
+            <HStack justify="end">
+              <Button
+                type="button"
+                variant="outline"
+                isLoading={planBusy}
+                leftIcon={<Network size={16} />}
+                onClick={previewPlan}
+              >
+                Preview
+              </Button>
+              <Button type="submit" isLoading={busy} leftIcon={<Plus size={16} />}>
+                Queue Job
+              </Button>
+            </HStack>
           </Stack>
         </Panel>
       </GridItem>
@@ -796,13 +912,13 @@ function KnowledgePage({
                   <Text fontSize="xs" color="ink.500">
                     Duplicates
                   </Text>
-                  <Text fontSize="sm">{selected.duplicate_memory_ids.length}</Text>
+                  <Text fontSize="sm">{selected.duplicate_count}</Text>
                 </Box>
                 <Box>
                   <Text fontSize="xs" color="ink.500">
                     Conflicts
                   </Text>
-                  <Text fontSize="sm">{selected.conflicting_memory_ids.length}</Text>
+                  <Text fontSize="sm">{selected.conflict_count}</Text>
                 </Box>
               </SimpleGrid>
               {selected.reviewed_by ? (
@@ -1566,6 +1682,34 @@ function ProvisioningPage({
     }
   }
 
+  async function retry(job: ProvisioningJob) {
+    setBusyJob(job.job_id);
+    try {
+      await retryProvisioningJob(csrf, job.job_id, "Retry requested from Operator admin panel.");
+      await onRefresh();
+    } catch (exc) {
+      toast({ status: "error", title: errorMessage(exc) });
+    } finally {
+      setBusyJob(null);
+    }
+  }
+
+  async function cleanup(job: ProvisioningJob) {
+    const confirmation = window.prompt(`Type cleanup ${job.tenant_id}`);
+    if (confirmation === null) {
+      return;
+    }
+    setBusyJob(job.job_id);
+    try {
+      await requestProvisioningCleanup(csrf, job.job_id, confirmation);
+      await onRefresh();
+    } catch (exc) {
+      toast({ status: "error", title: errorMessage(exc) });
+    } finally {
+      setBusyJob(null);
+    }
+  }
+
   return (
     <Panel title="Provisioning Jobs" icon={<ClipboardList size={18} />}>
       <TableView
@@ -1588,6 +1732,29 @@ function ProvisioningPage({
                 isLoading={busyJob === job.job_id}
                 isDisabled={!["queued", "running"].includes(job.state)}
                 onClick={() => cancel(job)}
+              />
+            </Tooltip>
+            <Tooltip label="Retry">
+              <IconButton
+                aria-label="Retry"
+                icon={<RotateCcw size={16} />}
+                size="sm"
+                variant="outline"
+                isLoading={busyJob === job.job_id}
+                isDisabled={!["failed", "canceled", "cancel_requested"].includes(job.state)}
+                onClick={() => retry(job)}
+              />
+            </Tooltip>
+            <Tooltip label="Cleanup">
+              <IconButton
+                aria-label="Cleanup"
+                icon={<XCircle size={16} />}
+                size="sm"
+                colorScheme="orange"
+                variant="outline"
+                isLoading={busyJob === job.job_id}
+                isDisabled={!["failed", "canceled", "cancel_requested"].includes(job.state)}
+                onClick={() => cleanup(job)}
               />
             </Tooltip>
           </HStack>

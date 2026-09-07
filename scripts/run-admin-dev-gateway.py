@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from pathlib import Path
 
 import uvicorn
 
@@ -46,8 +47,10 @@ def main() -> None:
     memory = MemoryModule(router, InMemoryGovernanceStore())
     asyncio.run(_seed_memory(memory, router))
     app = create_http_app(memory, tokens, control=control)
-    print("Admin dev Operator Access Token:", flush=True)
-    print(credential.access_token, flush=True)
+    token_path = Path("/tmp/coengram-admin-dev-token.txt")
+    token_path.write_text(f"{credential.access_token}\n", encoding="utf-8")
+    token_path.chmod(0o600)
+    print(f"Admin dev Operator Access Token written to {token_path}", flush=True)
     uvicorn.run(app, host="127.0.0.1", port=8080, access_log=False)
 
 

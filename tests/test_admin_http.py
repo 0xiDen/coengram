@@ -89,12 +89,66 @@ def test_admin_session_cookie_login_and_logout_require_csrf() -> None:
     assert client.get("/api/v1/admin/session").status_code == 401
 
 
+def test_admin_session_cookie_is_secure_when_request_is_https() -> None:
+    client, access_token = _client()
+    client.base_url = "https://admin.example.test"
+
+    logged_in = client.post("/api/v1/admin/session", json={"access_token": access_token})
+
+    assert logged_in.status_code == 201
+    assert "Secure" in logged_in.headers["set-cookie"]
+
+
 def test_admin_routes_reject_invalid_session_credentials() -> None:
     client, _access_token = _client()
 
     assert client.get("/api/v1/admin/session").status_code == 401
     response = client.post("/api/v1/admin/session", json={"access_token": "not-an-operator-token"})
     assert response.status_code == 401
+
+
+def test_admin_dashboard_returns_counts_token_warnings_and_action_queue() -> None:
+    client, access_token = _client()
+    login = client.post("/api/v1/admin/session", json={"access_token": access_token})
+    csrf_token = login.json()["csrf_token"]
+    created = client.post(
+        "/api/v1/admin/users",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "tenant_id": "tenant-a",
+            "principal_id": "user-dashboard",
+            "name": "Dashboard User",
+            "roles": ["tenant_member"],
+            "issue_token": True,
+            "token_lifetime_days": 1,
+        },
+    )
+    assert created.status_code == 201
+    job = client.post(
+        "/api/v1/admin/provisioning-jobs",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "idempotency_key": "tenant-dashboard-create-1",
+            "manifest": _manifest_document("tenant-dashboard"),
+        },
+    )
+    assert job.status_code == 201
+    canceled = client.post(
+        f"/api/v1/admin/provisioning-jobs/{job.json()['job_id']}/cancel",
+        headers={"X-CoEngram-CSRF": csrf_token},
+    )
+    assert canceled.status_code == 200
+
+    dashboard = client.get("/api/v1/admin/dashboard")
+
+    assert dashboard.status_code == 200
+    body = dashboard.json()
+    assert body["counts"]["tenants"] == 1
+    assert body["counts"]["active_tenants"] == 1
+    assert body["counts"]["active_principals"] == 1
+    assert body["token_warnings"]["expiring_principal_tokens"] == 1
+    assert body["failed_provisioning_jobs"] == []
+    assert body["recent_audit_events"]
 
 
 def test_admin_can_list_tenants_and_onboard_user_with_one_time_token() -> None:
@@ -158,6 +212,11 @@ def test_admin_can_create_list_and_cancel_provisioning_job_idempotently() -> Non
         "manifest": _manifest_document(),
     }
 
+    planned = client.post(
+        "/api/v1/admin/provisioning-plan",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={"manifest": _manifest_document()},
+    )
     created = client.post(
         "/api/v1/admin/provisioning-jobs",
         headers={"X-CoEngram-CSRF": csrf_token},
@@ -169,6 +228,10 @@ def test_admin_can_create_list_and_cancel_provisioning_job_idempotently() -> Non
         json=payload,
     )
 
+    assert planned.status_code == 200
+    assert planned.json()["tenant_id"] == "tenant-b"
+    assert planned.json()["manifest_fingerprint"]
+    assert planned.json()["cleanup_eligible"] is True
     assert created.status_code == 201
     assert repeated.status_code == 201
     body = created.json()
@@ -188,9 +251,86 @@ def test_admin_can_create_list_and_cancel_provisioning_job_idempotently() -> Non
 
     assert canceled.status_code == 200
     assert canceled.json()["state"] == "cancel_requested"
+    retried = client.post(
+        f"/api/v1/admin/provisioning-jobs/{body['job_id']}/retry",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={"reason": "Operator fixed the manifest environment."},
+    )
+    assert retried.status_code == 200
+    assert retried.json()["state"] == "queued"
     audit = client.get("/api/v1/admin/audit-events")
     actions = {event["action"] for event in audit.json()["events"]}
-    assert {"provisioning_job.create", "provisioning_job.cancel_requested"} <= actions
+    assert {
+        "provisioning_job.create",
+        "provisioning_job.cancel_requested",
+        "provisioning_job.retry",
+    } <= actions
+
+
+def test_admin_can_request_never_active_cleanup_with_exact_confirmation() -> None:
+    client, access_token = _client()
+    login = client.post("/api/v1/admin/session", json={"access_token": access_token})
+    csrf_token = login.json()["csrf_token"]
+    created = client.post(
+        "/api/v1/admin/provisioning-jobs",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "idempotency_key": "tenant-cleanup-create-1",
+            "manifest": _manifest_document("tenant-cleanup"),
+        },
+    )
+    canceled = client.post(
+        f"/api/v1/admin/provisioning-jobs/{created.json()['job_id']}/cancel",
+        headers={"X-CoEngram-CSRF": csrf_token},
+    )
+
+    wrong_confirmation = client.post(
+        f"/api/v1/admin/provisioning-jobs/{created.json()['job_id']}/cleanup",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={"confirmation": "cleanup tenant-other"},
+    )
+    requested = client.post(
+        f"/api/v1/admin/provisioning-jobs/{created.json()['job_id']}/cleanup",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={"confirmation": "cleanup tenant-cleanup"},
+    )
+
+    assert canceled.status_code == 200
+    assert wrong_confirmation.status_code == 409
+    assert requested.status_code == 200
+    assert requested.json()["state"] == "cleanup_requested"
+    audit = client.get("/api/v1/admin/audit-events")
+    actions = {event["action"] for event in audit.json()["events"]}
+    assert "provisioning_job.cleanup_requested" in actions
+
+
+def test_admin_cleanup_denies_active_tenants() -> None:
+    client, access_token = _client()
+    login = client.post("/api/v1/admin/session", json={"access_token": access_token})
+    csrf_token = login.json()["csrf_token"]
+    created = client.post(
+        "/api/v1/admin/provisioning-jobs",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "idempotency_key": "tenant-a-create-1",
+            "manifest": _manifest_document("tenant-a"),
+        },
+    )
+    assert created.status_code == 201
+    canceled = client.post(
+        f"/api/v1/admin/provisioning-jobs/{created.json()['job_id']}/cancel",
+        headers={"X-CoEngram-CSRF": csrf_token},
+    )
+    assert canceled.status_code == 200
+
+    requested = client.post(
+        f"/api/v1/admin/provisioning-jobs/{created.json()['job_id']}/cleanup",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={"confirmation": "cleanup tenant-a"},
+    )
+
+    assert requested.status_code == 409
+    assert "Active Tenants" in requested.json()["detail"]
 
 
 def test_admin_can_manage_operators_and_operator_tokens() -> None:
@@ -356,6 +496,8 @@ def test_admin_can_review_knowledge_candidates_without_private_sources_in_audit(
             ProposeKnowledge(
                 claim="Product A deploys with a guarded rollout.",
                 source_memory_ids=(source.id,),
+                duplicate_memory_ids=("private-duplicate-source",),
+                conflicting_memory_ids=("private-conflict-source",),
                 idempotency_key="admin-knowledge-candidate",
             ),
         )
@@ -389,10 +531,15 @@ def test_admin_can_review_knowledge_candidates_without_private_sources_in_audit(
     listed_body = listed.json()
     assert listed_body["candidates"][0]["id"] == candidate_id
     assert listed_body["candidates"][0]["source_count"] == 1
+    assert listed_body["candidates"][0]["duplicate_count"] == 1
+    assert listed_body["candidates"][0]["conflict_count"] == 1
     assert "source_memory_ids" not in listed.text
+    assert "duplicate_memory_ids" not in listed.text
+    assert "private-duplicate-source" not in listed.text
     assert missing_csrf.status_code == 401
     assert reviewed.status_code == 200
     assert reviewed.json()["status"] == "publishing"
+    assert "duplicate_memory_ids" not in reviewed.text
     assert reviewed.json()["reviewed_by"] == "operator:operator-knowledge"
 
     audit = client.get("/api/v1/admin/audit-events")
@@ -531,8 +678,7 @@ def test_support_lens_exposes_memory_metadata_and_graph_without_private_content(
     graph_body = graph.json()
     graph_node_ids = {node["node_id"] for node in graph_body["nodes"]}
     graph_edges = {
-        (edge["source_id"], edge["target_id"], edge["label"])
-        for edge in graph_body["edges"]
+        (edge["source_id"], edge["target_id"], edge["label"]) for edge in graph_body["edges"]
     }
     assert f"candidate:{candidate_id}" in graph_node_ids
     assert f"knowledge:{published_id}" in graph_node_ids
@@ -613,6 +759,74 @@ def test_provisioning_mutations_require_tenant_provisioner_or_operator_admin() -
 
     assert listed.status_code == 200
     assert created.status_code == 403
+
+
+def test_admin_role_matrix_for_identity_and_tokens() -> None:
+    store = InMemoryControlStore()
+    control = ControlModule(store, TokenService(store))
+    control.create_tenant("tenant-a", "Product A")
+    control.create_principal("user-cora", "Cora", PrincipalKind.USER.value)
+    control.grant_membership("tenant-a", "user-cora", "tenant_member")
+    control.issue_access_token("tenant-a", "user-cora")
+    control.create_operator("operator-token", "Token", frozenset({"token_admin"}))
+    control.create_operator("operator-support", "Support", frozenset({"tenant_support"}))
+    control.create_operator("operator-bob", "Bob", frozenset({"tenant_support"}))
+    token_credential = control.issue_operator_access_token("operator-token")
+    support_credential = control.issue_operator_access_token("operator-support")
+    app = create_http_app(
+        MemoryModule(InMemoryTenantMemoryRouter(["tenant-a"])),
+        TokenService(store),
+        control=control,
+    )
+
+    token_client = TestClient(app)
+    token_login = token_client.post(
+        "/api/v1/admin/session",
+        json={"access_token": token_credential.access_token},
+    )
+    token_csrf = token_login.json()["csrf_token"]
+    support_client = TestClient(app)
+    support_login = support_client.post(
+        "/api/v1/admin/session",
+        json={"access_token": support_credential.access_token},
+    )
+    support_csrf = support_login.json()["csrf_token"]
+
+    token_principals = token_client.get("/api/v1/admin/principals")
+    token_metadata = token_client.get(
+        "/api/v1/admin/tokens",
+        params={"tenant_id": "tenant-a", "principal_id": "user-cora"},
+    )
+    token_mutation = token_client.post(
+        "/api/v1/admin/tokens",
+        headers={"X-CoEngram-CSRF": token_csrf},
+        json={"tenant_id": "tenant-a", "principal_id": "user-cora", "lifetime_days": 7},
+    )
+    support_metadata = support_client.get(
+        "/api/v1/admin/tokens",
+        params={"tenant_id": "tenant-a", "principal_id": "user-cora"},
+    )
+    support_mutation = support_client.post(
+        "/api/v1/admin/tokens",
+        headers={"X-CoEngram-CSRF": support_csrf},
+        json={"tenant_id": "tenant-a", "principal_id": "user-cora", "lifetime_days": 7},
+    )
+    operator_token_mutation = token_client.post(
+        "/api/v1/admin/operators/operator-bob/tokens",
+        headers={"X-CoEngram-CSRF": token_csrf},
+        json={"lifetime_days": 7},
+    )
+    own_operator_tokens = support_client.get("/api/v1/admin/operators/operator-support/tokens")
+    other_operator_tokens = support_client.get("/api/v1/admin/operators/operator-bob/tokens")
+
+    assert token_principals.status_code == 403
+    assert token_metadata.status_code == 200
+    assert token_mutation.status_code == 201
+    assert support_metadata.status_code == 200
+    assert support_mutation.status_code == 403
+    assert operator_token_mutation.status_code == 201
+    assert own_operator_tokens.status_code == 200
+    assert other_operator_tokens.status_code == 403
 
 
 def test_audit_events_require_audit_viewer_or_operator_admin() -> None:

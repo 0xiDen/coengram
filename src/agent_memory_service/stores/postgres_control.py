@@ -618,6 +618,30 @@ class PostgresControlStore:
             UPDATE control.provisioning_jobs
             SET state = %s,
                 updated_at = %s,
+                claimed_by = CASE
+                    WHEN %s = 'queued' THEN NULL
+                    ELSE claimed_by
+                END,
+                claimed_at = CASE
+                    WHEN %s = 'queued' THEN NULL
+                    ELSE claimed_at
+                END,
+                heartbeat_at = CASE
+                    WHEN %s = 'queued' THEN NULL
+                    ELSE heartbeat_at
+                END,
+                completed_steps = CASE
+                    WHEN %s = 'queued' THEN '[]'::jsonb
+                    ELSE completed_steps
+                END,
+                failed_step = CASE
+                    WHEN %s = 'queued' THEN NULL
+                    ELSE failed_step
+                END,
+                failure_code = CASE
+                    WHEN %s = 'queued' THEN NULL
+                    ELSE failure_code
+                END,
                 cancel_requested_at = CASE
                     WHEN %s = 'cancel_requested'
                     THEN COALESCE(cancel_requested_at, %s)
@@ -639,6 +663,12 @@ class PostgresControlStore:
             (
                 state.value,
                 changed_at,
+                state.value,
+                state.value,
+                state.value,
+                state.value,
+                state.value,
+                state.value,
                 state.value,
                 changed_at,
                 state.value,

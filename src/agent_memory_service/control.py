@@ -497,10 +497,26 @@ class InMemoryControlStore:
             current,
             state=state,
             updated_at=changed_at,
+            claimed_by=None if state is ProvisioningJobState.QUEUED else current.claimed_by,
+            claimed_at=None if state is ProvisioningJobState.QUEUED else current.claimed_at,
+            heartbeat_at=None if state is ProvisioningJobState.QUEUED else current.heartbeat_at,
+            completed_steps=() if state is ProvisioningJobState.QUEUED else current.completed_steps,
+            failed_step=None if state is ProvisioningJobState.QUEUED else current.failed_step,
+            failure_code=None if state is ProvisioningJobState.QUEUED else current.failure_code,
             cancel_requested_at=(
                 changed_at
                 if state is ProvisioningJobState.CANCEL_REQUESTED
                 else current.cancel_requested_at
+            ),
+            cleanup_requested_at=(
+                changed_at
+                if state is ProvisioningJobState.CLEANUP_REQUESTED
+                else current.cleanup_requested_at
+            ),
+            cleanup_completed_at=(
+                changed_at
+                if state is ProvisioningJobState.CLEANED_UP
+                else current.cleanup_completed_at
             ),
         )
         self._provisioning_jobs[job_id] = updated
@@ -1211,6 +1227,71 @@ class ControlModule:
         self.record_operator_audit_event(
             session,
             action="provisioning_job.cancel_requested",
+            target_type="provisioning_job",
+            target_ids={"job_id": updated.job_id, "tenant_id": updated.tenant_id},
+        )
+        return updated
+
+    def retry_provisioning_job(
+        self,
+        session: OperatorSession,
+        job_id: str,
+    ) -> ProvisioningJobRecord:
+        job = self._store.get_provisioning_job(job_id)
+        if job is None:
+            raise ControlNotFound("Provisioning Job not found")
+        if job.state not in {
+            ProvisioningJobState.FAILED,
+            ProvisioningJobState.CANCELED,
+            ProvisioningJobState.CANCEL_REQUESTED,
+        }:
+            raise ValueError("Only failed or canceled Provisioning Jobs can be retried")
+        updated = self._store.update_provisioning_job_state(
+            job_id,
+            state=ProvisioningJobState.QUEUED,
+            changed_at=datetime.now(UTC),
+        )
+        self.record_operator_audit_event(
+            session,
+            action="provisioning_job.retry",
+            target_type="provisioning_job",
+            target_ids={"job_id": updated.job_id, "tenant_id": updated.tenant_id},
+            after_metadata={"next_state": updated.state.value},
+        )
+        return updated
+
+    def request_provisioning_cleanup(
+        self,
+        session: OperatorSession,
+        job_id: str,
+        *,
+        confirmation: str,
+    ) -> ProvisioningJobRecord:
+        job = self._store.get_provisioning_job(job_id)
+        if job is None:
+            raise ControlNotFound("Provisioning Job not found")
+        expected_confirmation = f"cleanup {job.tenant_id}"
+        if confirmation != expected_confirmation:
+            raise ValueError(
+                f"Provisioning Cleanup confirmation must be exactly '{expected_confirmation}'"
+            )
+        if job.state not in {
+            ProvisioningJobState.FAILED,
+            ProvisioningJobState.CANCELED,
+            ProvisioningJobState.CANCEL_REQUESTED,
+        }:
+            raise ValueError("Only failed or canceled Provisioning Jobs can request cleanup")
+        tenant = self._store.get_tenant(job.tenant_id)
+        if tenant is not None and tenant.active:
+            raise ValueError("Active Tenants must use Tenant decommissioning, not cleanup")
+        updated = self._store.update_provisioning_job_state(
+            job_id,
+            state=ProvisioningJobState.CLEANUP_REQUESTED,
+            changed_at=datetime.now(UTC),
+        )
+        self.record_operator_audit_event(
+            session,
+            action="provisioning_job.cleanup_requested",
             target_type="provisioning_job",
             target_ids={"job_id": updated.job_id, "tenant_id": updated.tenant_id},
         )
