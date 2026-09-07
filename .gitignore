@@ -8,6 +8,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+/admin/dist/
+/admin/node_modules/
+/admin/*.tsbuildinfo
+/admin/vite.config.d.ts
+/admin/vite.config.js
 /secrets/
 deploy/secrets/*
 !deploy/secrets/README.md

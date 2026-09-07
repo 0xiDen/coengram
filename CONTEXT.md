@@ -12,6 +12,15 @@ _Avoid_: Team, workspace, organization
 An authenticated actor making a memory request. A principal is either a User or an Agent and receives access through Tenant Membership rather than choosing a tenant in tool arguments.
 _Avoid_: Client, caller
 
+**Operator**:
+An authenticated deployment-wide administrative identity that can manage platform control-plane state outside a Tenant Session. An Operator is not a Principal or Tenant Member unless a separate Principal identity grants tenant-scoped memory access.
+_Avoid_: Global admin, superuser, Tenant Administrator
+
+**Operator Role**:
+A deployment-wide permission granted to an Operator for a bounded class of administrative actions. Operator Roles do not grant Tenant Membership or direct access to Private Memory content.
+The initial roles are operator_admin, identity_admin, tenant_provisioner, tenant_support, knowledge_admin, token_admin, and audit_viewer.
+_Avoid_: Global role, admin permission, Tenant role
+
 **User**:
 A human Principal who uses agents and owns personal memories within an authorized Tenant.
 _Avoid_: End user, person account
@@ -32,9 +41,33 @@ _Avoid_: Tenant header, selected team
 A revocable credential issued to one Principal for one Tenant Membership. An Agent token is either autonomous or bound to exactly one Delegation and Subject User; request arguments cannot change that scope.
 _Avoid_: API key, tenant token
 
+**Operator Access Token**:
+A revocable credential issued to one Operator for deployment-wide administrative access. It is not bound to a Tenant Session and cannot by itself read or write Private Memory.
+_Avoid_: Admin API key, root token, shared secret
+
+**Admin Session**:
+A short-lived browser session established after an Operator authenticates with an Operator Access Token. It authorizes admin panel requests without exposing the underlying Operator Access Token to client-side application code after login.
+_Avoid_: Remembered token, browser API key, frontend credential
+
+**Operator Service**:
+A trusted deployment-local service that performs explicit host-side administrative work requested by authenticated Operators. It owns host mutation boundaries such as Tenant provisioning while keeping the shared gateway from receiving direct infrastructure authority.
+_Avoid_: Admin worker, provisioning sidecar, gateway shell
+
+**Operator Audit Event**:
+A structured, content-safe record of an Operator action, including the Operator, role context, action, target identifiers, request identity, timing, and safe before/after metadata. It never stores Access Token secrets or Private Memory content.
+_Avoid_: Admin log, activity row, raw request log
+
 **Tenant Manifest**:
 A versioned, secret-free representation of Tenants, Principals, Tenant Memberships, roles, and policies for validation, export, and idempotent import. Access Tokens are reissued after import rather than included in a manifest.
 _Avoid_: Configuration export, tenant backup
+
+**Provisioning Job**:
+An auditable asynchronous request to plan, apply, resume, or inspect Tenant provisioning. It is requested through the admin API by an Operator and executed by the Operator Service.
+_Avoid_: Background task, create tenant request, provisioning run
+
+**Provisioning Cleanup**:
+An explicit, audited Operator action that removes incomplete Tenant provisioning artifacts after a Provisioning Job fails or is canceled before activation. It is not automatic rollback and requires deliberate confirmation of the affected Tenant.
+_Avoid_: Rollback, reset, automatic cleanup
 
 **Tenant Memory Store**:
 The isolated Neo4j Community instance and persistent graph owned by exactly one Tenant. Principals never select a store directly; their Tenant Session determines it.
@@ -80,6 +113,14 @@ _Avoid_: Memory export, backup
 Reviewed facts, entities, conventions, and decisions intentionally shared for recall and learning by authorized Users and Agents in a Tenant.
 _Avoid_: Team memory, shared memory
 
+**Tenant Knowledge Revision**:
+An auditable version of a Tenant Knowledge item that supersedes an earlier published item while preserving the earlier item's history and attribution.
+_Avoid_: Knowledge edit, overwrite, replacement fact
+
+**Tenant Knowledge Deprecation**:
+An audited decision that marks a Tenant Knowledge item as no longer recommended for recall or learning without erasing its history.
+_Avoid_: Delete shared memory, remove fact, hide item
+
 **Agent Record**:
 An Agent's tool and reasoning history retained for audit and debugging but excluded from ordinary memory recall.
 _Avoid_: Agent memory, trace memory
@@ -87,6 +128,10 @@ _Avoid_: Agent memory, trace memory
 **Knowledge Candidate**:
 A distilled claim proposed from Private Memory for possible inclusion in Tenant Knowledge, with provenance back to its private source but without exposing that source to reviewers.
 _Avoid_: Suggested memory, draft knowledge
+
+**Knowledge Candidate Revision**:
+An auditable version of a Knowledge Candidate's claim created before review or publication. A revision preserves the original candidate identity and provenance while recording who changed the claim and why.
+_Avoid_: Candidate edit, overwrite, replacement candidate
 
 **Promotion**:
 The human-reviewed transition by which an accepted Knowledge Candidate becomes Tenant Knowledge. Promotion copies an approved claim, records an audit trail, and never changes the visibility of its source Personal Memory.

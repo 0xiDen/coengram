@@ -22,6 +22,15 @@
 }
 
 (memory_gateway_routes) {
+	@admin_root path /admin
+	redir @admin_root /admin/
+
+	handle_path /admin/* {
+		root * /srv/coengram-admin
+		try_files {path} /index.html
+		file_server
+	}
+
 	@oauth_metadata path /.well-known/oauth-protected-resource
 	handle @oauth_metadata {
 		request_body {

@@ -5,18 +5,41 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from agent_memory_service.auth import (
+    AuthenticationError,
     IssuedCredential,
     RotatedCredential,
     TokenRecord,
     TokenService,
 )
 from agent_memory_service.models import PrincipalKind, TenantSession
+from agent_memory_service.operator_audit import (
+    OperatorAuditEvent,
+    create_operator_audit_event,
+)
+from agent_memory_service.operator_auth import (
+    AdminSessionRecord,
+    AdminSessionService,
+    IssuedAdminSession,
+    OperatorSession,
+    OperatorTokenRecord,
+    OperatorTokenService,
+)
+from agent_memory_service.operator_provisioning import (
+    ProvisioningJobRecord,
+    ProvisioningJobState,
+    new_provisioning_job,
+)
+from agent_memory_service.provisioning import ProvisioningStep
+from agent_memory_service.roles import VALID_OPERATOR_ROLES, VALID_ROLES
 
-VALID_ROLES = frozenset({"tenant_administrator", "knowledge_curator", "tenant_member"})
+if TYPE_CHECKING:
+    from agent_memory_service.manifest import TenantManifest
+
 UNUSED_TOKEN_AGE = timedelta(days=30)
+OPERATOR_TOKEN_LIFETIME = timedelta(days=30)
 
 
 class ControlConflict(ValueError):
@@ -39,6 +62,14 @@ class PrincipalRecord:
     principal_id: str
     name: str
     kind: PrincipalKind
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorRecord:
+    operator_id: str
+    name: str
+    roles: frozenset[str]
     active: bool = True
 
 
@@ -82,9 +113,105 @@ class TenantRouteRecord:
 
 
 class ControlStore(Protocol):
+    def add_operator(self, record: OperatorRecord) -> None: ...
+
+    def get_operator(self, operator_id: str) -> OperatorRecord | None: ...
+
+    def list_operators(self) -> tuple[OperatorRecord, ...]: ...
+
+    def update_operator(
+        self,
+        operator_id: str,
+        *,
+        name: str,
+        roles: frozenset[str],
+        active: bool,
+        changed_at: datetime,
+    ) -> OperatorRecord: ...
+
+    def count_active_operator_admins(self) -> int: ...
+
+    def save_operator_token(self, record: OperatorTokenRecord) -> None: ...
+
+    def get_operator_token(self, token_id: str) -> OperatorTokenRecord | None: ...
+
+    def revoke_operator_token(self, token_id: str, revoked_at: datetime) -> bool: ...
+
+    def mark_operator_token_used(self, token_id: str, used_at: datetime) -> None: ...
+
+    def rotate_operator_token(
+        self,
+        previous_token_id: str,
+        replacement: OperatorTokenRecord,
+        *,
+        previous_valid_until: datetime,
+        rotated_at: datetime,
+    ) -> bool: ...
+
+    def list_operator_token_records(self, operator_id: str) -> tuple[OperatorTokenRecord, ...]: ...
+
+    def save_admin_session(self, record: AdminSessionRecord) -> None: ...
+
+    def get_admin_session(self, session_id: str) -> AdminSessionRecord | None: ...
+
+    def revoke_admin_session(self, session_id: str, revoked_at: datetime) -> bool: ...
+
+    def mark_admin_session_used(
+        self,
+        session_id: str,
+        used_at: datetime,
+        idle_expires_at: datetime,
+    ) -> None: ...
+
+    def save_operator_audit_event(self, event: OperatorAuditEvent) -> None: ...
+
+    def list_operator_audit_events(self, *, limit: int) -> tuple[OperatorAuditEvent, ...]: ...
+
+    def create_provisioning_job(self, record: ProvisioningJobRecord) -> ProvisioningJobRecord: ...
+
+    def get_provisioning_job(self, job_id: str) -> ProvisioningJobRecord | None: ...
+
+    def list_provisioning_jobs(self) -> tuple[ProvisioningJobRecord, ...]: ...
+
+    def update_provisioning_job_state(
+        self,
+        job_id: str,
+        *,
+        state: ProvisioningJobState,
+        changed_at: datetime,
+    ) -> ProvisioningJobRecord: ...
+
+    def claim_next_provisioning_job(
+        self,
+        *,
+        worker_id: str,
+        claimed_at: datetime,
+    ) -> ProvisioningJobRecord | None: ...
+
+    def complete_provisioning_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        completed_steps: tuple[ProvisioningStep, ...],
+        completed_at: datetime,
+    ) -> ProvisioningJobRecord: ...
+
+    def fail_provisioning_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        failed_step: ProvisioningStep | None,
+        failure_code: str,
+        failed_at: datetime,
+    ) -> ProvisioningJobRecord: ...
+
     def add_tenant(self, record: TenantRecord) -> None: ...
 
     def get_tenant(self, tenant_id: str) -> TenantRecord | None: ...
+
+    def list_tenants(self) -> tuple[TenantRecord, ...]: ...
 
     def add_principal(self, record: PrincipalRecord) -> None: ...
 
@@ -166,6 +293,13 @@ class InMemoryControlStore:
     """Deterministic Control Store Adapter used by contract tests and local demos."""
 
     def __init__(self) -> None:
+        self._operators: dict[str, OperatorRecord] = {}
+        self._operator_tokens: dict[str, OperatorTokenRecord] = {}
+        self._admin_sessions: dict[str, AdminSessionRecord] = {}
+        self._operator_audit_events: dict[str, OperatorAuditEvent] = {}
+        self._provisioning_jobs: dict[str, ProvisioningJobRecord] = {}
+        self._provisioning_job_keys: dict[tuple[str, str], str] = {}
+        self._provisioning_manifest_keys: dict[tuple[str, str], str] = {}
         self._tenants: dict[str, TenantRecord] = {}
         self._principals: dict[str, PrincipalRecord] = {}
         self._memberships: dict[tuple[str, str], MembershipRecord] = {}
@@ -175,6 +309,280 @@ class InMemoryControlStore:
         self._tokens: dict[str, TokenRecord] = {}
         self._token_lifetime_days: dict[tuple[str, PrincipalKind, bool], int] = {}
 
+    def add_operator(self, record: OperatorRecord) -> None:
+        if record.operator_id in self._operators:
+            raise ControlConflict("Operator already exists")
+        self._operators[record.operator_id] = record
+
+    def get_operator(self, operator_id: str) -> OperatorRecord | None:
+        return self._operators.get(operator_id)
+
+    def list_operators(self) -> tuple[OperatorRecord, ...]:
+        return tuple(self._operators[key] for key in sorted(self._operators))
+
+    def update_operator(
+        self,
+        operator_id: str,
+        *,
+        name: str,
+        roles: frozenset[str],
+        active: bool,
+        changed_at: datetime,
+    ) -> OperatorRecord:
+        current = self._operators.get(operator_id)
+        if current is None:
+            raise ControlNotFound("Operator not found")
+        updated = replace(current, name=name, roles=roles, active=active)
+        self._operators[operator_id] = updated
+        if current.roles != roles or current.active != active:
+            for token_id, token in tuple(self._operator_tokens.items()):
+                if token.session.operator_id == operator_id and token.revoked_at is None:
+                    self._operator_tokens[token_id] = replace(token, revoked_at=changed_at)
+            for session_id, session in tuple(self._admin_sessions.items()):
+                if session.session.operator_id == operator_id and session.revoked_at is None:
+                    self._admin_sessions[session_id] = replace(session, revoked_at=changed_at)
+        return updated
+
+    def count_active_operator_admins(self) -> int:
+        return sum(
+            1
+            for operator in self._operators.values()
+            if operator.active and "operator_admin" in operator.roles
+        )
+
+    def save_operator_token(self, record: OperatorTokenRecord) -> None:
+        self._operator_tokens[record.token_id] = record
+
+    def get_operator_token(self, token_id: str) -> OperatorTokenRecord | None:
+        record = self._operator_tokens.get(token_id)
+        if record is None:
+            return None
+        operator = self._operators.get(record.session.operator_id)
+        if operator is None or not operator.active or not operator.roles:
+            return None
+        return record
+
+    def revoke_operator_token(self, token_id: str, revoked_at: datetime) -> bool:
+        existing = self._operator_tokens.get(token_id)
+        if existing is None:
+            return False
+        if existing.revoked_at is None:
+            self._operator_tokens[token_id] = replace(existing, revoked_at=revoked_at)
+        return True
+
+    def mark_operator_token_used(self, token_id: str, used_at: datetime) -> None:
+        existing = self._operator_tokens.get(token_id)
+        if existing is None:
+            return
+        self._operator_tokens[token_id] = replace(existing, last_used_at=used_at)
+
+    def rotate_operator_token(
+        self,
+        previous_token_id: str,
+        replacement: OperatorTokenRecord,
+        *,
+        previous_valid_until: datetime,
+        rotated_at: datetime,
+    ) -> bool:
+        previous = self.get_operator_token(previous_token_id)
+        if (
+            previous is None
+            or previous.revoked_at is not None
+            or previous.expires_at <= rotated_at
+            or replacement.token_id in self._operator_tokens
+            or previous.session.operator_id != replacement.session.operator_id
+        ):
+            return False
+        self._operator_tokens[previous_token_id] = replace(
+            previous,
+            expires_at=min(previous.expires_at, previous_valid_until),
+        )
+        self._operator_tokens[replacement.token_id] = replacement
+        return True
+
+    def list_operator_token_records(self, operator_id: str) -> tuple[OperatorTokenRecord, ...]:
+        return tuple(
+            sorted(
+                (
+                    record
+                    for record in self._operator_tokens.values()
+                    if record.session.operator_id == operator_id
+                ),
+                key=lambda record: (record.issued_at, record.token_id),
+            )
+        )
+
+    def save_admin_session(self, record: AdminSessionRecord) -> None:
+        self._admin_sessions[record.session_id] = record
+
+    def get_admin_session(self, session_id: str) -> AdminSessionRecord | None:
+        record = self._admin_sessions.get(session_id)
+        if record is None:
+            return None
+        operator = self._operators.get(record.session.operator_id)
+        if operator is None or not operator.active or not operator.roles:
+            return None
+        return record
+
+    def revoke_admin_session(self, session_id: str, revoked_at: datetime) -> bool:
+        existing = self._admin_sessions.get(session_id)
+        if existing is None:
+            return False
+        if existing.revoked_at is None:
+            self._admin_sessions[session_id] = replace(existing, revoked_at=revoked_at)
+        return True
+
+    def mark_admin_session_used(
+        self,
+        session_id: str,
+        used_at: datetime,
+        idle_expires_at: datetime,
+    ) -> None:
+        existing = self._admin_sessions.get(session_id)
+        if existing is None:
+            return
+        self._admin_sessions[session_id] = replace(
+            existing,
+            last_used_at=used_at,
+            idle_expires_at=idle_expires_at,
+        )
+
+    def save_operator_audit_event(self, event: OperatorAuditEvent) -> None:
+        self._operator_audit_events[event.event_id] = event
+
+    def list_operator_audit_events(self, *, limit: int) -> tuple[OperatorAuditEvent, ...]:
+        return tuple(
+            sorted(
+                self._operator_audit_events.values(),
+                key=lambda event: (event.created_at, event.event_id),
+                reverse=True,
+            )[:limit]
+        )
+
+    def create_provisioning_job(self, record: ProvisioningJobRecord) -> ProvisioningJobRecord:
+        request_key = (record.requested_by_operator_id, record.idempotency_key)
+        if job_id := self._provisioning_job_keys.get(request_key):
+            return self._provisioning_jobs[job_id]
+        manifest_key = (record.tenant_id, record.manifest_fingerprint)
+        if job_id := self._provisioning_manifest_keys.get(manifest_key):
+            return self._provisioning_jobs[job_id]
+        self._provisioning_jobs[record.job_id] = record
+        self._provisioning_job_keys[request_key] = record.job_id
+        self._provisioning_manifest_keys[manifest_key] = record.job_id
+        return record
+
+    def get_provisioning_job(self, job_id: str) -> ProvisioningJobRecord | None:
+        return self._provisioning_jobs.get(job_id)
+
+    def list_provisioning_jobs(self) -> tuple[ProvisioningJobRecord, ...]:
+        return tuple(
+            sorted(
+                self._provisioning_jobs.values(),
+                key=lambda job: (job.created_at, job.job_id),
+                reverse=True,
+            )
+        )
+
+    def update_provisioning_job_state(
+        self,
+        job_id: str,
+        *,
+        state: ProvisioningJobState,
+        changed_at: datetime,
+    ) -> ProvisioningJobRecord:
+        current = self._provisioning_jobs.get(job_id)
+        if current is None:
+            raise ControlNotFound("Provisioning Job not found")
+        updated = replace(
+            current,
+            state=state,
+            updated_at=changed_at,
+            cancel_requested_at=(
+                changed_at
+                if state is ProvisioningJobState.CANCEL_REQUESTED
+                else current.cancel_requested_at
+            ),
+        )
+        self._provisioning_jobs[job_id] = updated
+        return updated
+
+    def claim_next_provisioning_job(
+        self,
+        *,
+        worker_id: str,
+        claimed_at: datetime,
+    ) -> ProvisioningJobRecord | None:
+        for job in sorted(
+            self._provisioning_jobs.values(),
+            key=lambda candidate: (candidate.created_at, candidate.job_id),
+        ):
+            if job.state is not ProvisioningJobState.QUEUED:
+                continue
+            claimed = replace(
+                job,
+                state=ProvisioningJobState.RUNNING,
+                attempt=job.attempt + 1,
+                claimed_by=worker_id,
+                claimed_at=claimed_at,
+                heartbeat_at=claimed_at,
+                updated_at=claimed_at,
+            )
+            self._provisioning_jobs[job.job_id] = claimed
+            return claimed
+        return None
+
+    def complete_provisioning_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        completed_steps: tuple[ProvisioningStep, ...],
+        completed_at: datetime,
+    ) -> ProvisioningJobRecord:
+        current = self._require_running_provisioning_job(job_id, worker_id)
+        completed = replace(
+            current,
+            state=ProvisioningJobState.SUCCEEDED,
+            completed_steps=completed_steps,
+            failed_step=None,
+            failure_code=None,
+            updated_at=completed_at,
+        )
+        self._provisioning_jobs[job_id] = completed
+        return completed
+
+    def fail_provisioning_job(
+        self,
+        job_id: str,
+        *,
+        worker_id: str,
+        failed_step: ProvisioningStep | None,
+        failure_code: str,
+        failed_at: datetime,
+    ) -> ProvisioningJobRecord:
+        current = self._require_running_provisioning_job(job_id, worker_id)
+        failed = replace(
+            current,
+            state=ProvisioningJobState.FAILED,
+            failed_step=failed_step,
+            failure_code=failure_code,
+            updated_at=failed_at,
+        )
+        self._provisioning_jobs[job_id] = failed
+        return failed
+
+    def _require_running_provisioning_job(
+        self,
+        job_id: str,
+        worker_id: str,
+    ) -> ProvisioningJobRecord:
+        current = self._provisioning_jobs.get(job_id)
+        if current is None:
+            raise ControlNotFound("Provisioning Job not found")
+        if current.state is not ProvisioningJobState.RUNNING or current.claimed_by != worker_id:
+            raise ControlConflict("Provisioning Job is not claimed by this worker")
+        return current
+
     def add_tenant(self, record: TenantRecord) -> None:
         if record.tenant_id in self._tenants:
             raise ControlConflict("Tenant already exists")
@@ -182,6 +590,9 @@ class InMemoryControlStore:
 
     def get_tenant(self, tenant_id: str) -> TenantRecord | None:
         return self._tenants.get(tenant_id)
+
+    def list_tenants(self) -> tuple[TenantRecord, ...]:
+        return tuple(self._tenants[key] for key in sorted(self._tenants))
 
     def add_principal(self, record: PrincipalRecord) -> None:
         if record.principal_id in self._principals:
@@ -536,17 +947,282 @@ def is_token_unused_for_30_days(record: TokenRecord, *, now: datetime) -> bool:
     )
 
 
+def _validate_operator_roles(roles: frozenset[str]) -> None:
+    unknown_roles = roles - VALID_OPERATOR_ROLES
+    if unknown_roles:
+        raise ValueError(f"Unknown Operator Roles: {', '.join(sorted(unknown_roles))}")
+
+
 class ControlModule:
     """Deep control-plane Interface; storage and CLI details remain behind Adapters."""
 
     def __init__(self, store: ControlStore, tokens: TokenService) -> None:
         self._store = store
         self._tokens = tokens
+        self._operator_tokens = OperatorTokenService(store)
+        self._admin_sessions = AdminSessionService(store)
+
+    def create_operator(
+        self,
+        operator_id: str,
+        name: str,
+        roles: frozenset[str],
+    ) -> OperatorRecord:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Operator name cannot be empty")
+        _validate_operator_roles(roles)
+        record = OperatorRecord(
+            operator_id=operator_id,
+            name=normalized_name,
+            roles=roles,
+        )
+        self._store.add_operator(record)
+        return record
+
+    def inspect_operator(self, operator_id: str) -> OperatorRecord:
+        record = self._store.get_operator(operator_id)
+        if record is None:
+            raise ControlNotFound("Operator not found")
+        return record
+
+    def list_operators(self) -> tuple[OperatorRecord, ...]:
+        return self._store.list_operators()
+
+    def update_operator(
+        self,
+        operator_id: str,
+        *,
+        name: str | None = None,
+        roles: frozenset[str] | None = None,
+        active: bool | None = None,
+    ) -> OperatorRecord:
+        current = self.inspect_operator(operator_id)
+        if name is None and roles is None and active is None:
+            raise ValueError("Operator update requires a name, roles, or active state")
+        normalized_name = current.name if name is None else name.strip()
+        if not normalized_name:
+            raise ValueError("Operator name cannot be empty")
+        selected_roles = current.roles if roles is None else frozenset(roles)
+        _validate_operator_roles(selected_roles)
+        selected_active = current.active if active is None else active
+        removing_final_admin = (
+            current.active
+            and "operator_admin" in current.roles
+            and (not selected_active or "operator_admin" not in selected_roles)
+            and self._store.count_active_operator_admins() <= 1
+        )
+        if removing_final_admin:
+            raise ValueError("Cannot remove the final active operator_admin")
+        return self._store.update_operator(
+            operator_id,
+            name=normalized_name,
+            roles=selected_roles,
+            active=selected_active,
+            changed_at=datetime.now(UTC),
+        )
+
+    def issue_operator_access_token(
+        self,
+        operator_id: str,
+        *,
+        lifetime: timedelta | None = None,
+    ) -> IssuedCredential:
+        operator = self.inspect_operator(operator_id)
+        if not operator.active:
+            raise ControlNotFound("Active Operator not found")
+        if not operator.roles:
+            raise PermissionError("Operator Access Token requires at least one Operator Role")
+        requested_lifetime = OPERATOR_TOKEN_LIFETIME if lifetime is None else lifetime
+        if requested_lifetime <= timedelta(0) or requested_lifetime > OPERATOR_TOKEN_LIFETIME:
+            raise ValueError("Operator Access Token lifetime exceeds the platform maximum")
+        return self._operator_tokens.issue(
+            OperatorSession(operator_id=operator.operator_id, roles=operator.roles),
+            lifetime=requested_lifetime,
+        )
+
+    def authenticate_operator(self, access_token: str) -> OperatorSession:
+        session = self._operator_tokens.authenticate(access_token)
+        operator = self.inspect_operator(session.operator_id)
+        if not operator.active or not operator.roles:
+            raise AuthenticationError("Active Operator with roles not found")
+        return OperatorSession(
+            operator_id=operator.operator_id,
+            roles=operator.roles,
+            token_id=session.token_id,
+        )
+
+    def revoke_operator_access_token(self, token_id: str) -> bool:
+        return self._operator_tokens.revoke(token_id)
+
+    def rotate_operator_access_token(
+        self,
+        token_id: str,
+        *,
+        overlap: timedelta,
+        lifetime: timedelta | None = None,
+    ) -> RotatedCredential:
+        if overlap <= timedelta(0) or overlap > timedelta(hours=24):
+            raise ValueError(
+                "Operator token rotation overlap must be between 1 second and 24 hours"
+            )
+        previous = self._store.get_operator_token(token_id)
+        now = datetime.now(UTC)
+        if previous is None or previous.revoked_at is not None or previous.expires_at <= now:
+            raise ControlNotFound("Active Operator Access Token not found")
+        operator = self.inspect_operator(previous.session.operator_id)
+        if not operator.active or not operator.roles:
+            raise ControlNotFound("Active Operator not found")
+        requested_lifetime = OPERATOR_TOKEN_LIFETIME if lifetime is None else lifetime
+        if requested_lifetime <= timedelta(0) or requested_lifetime > OPERATOR_TOKEN_LIFETIME:
+            raise ValueError("Replacement Operator Access Token lifetime exceeds maximum")
+        bounded_overlap = min(overlap, previous.expires_at - now)
+        return self._operator_tokens.rotate(
+            token_id,
+            OperatorSession(operator_id=operator.operator_id, roles=operator.roles),
+            lifetime=requested_lifetime,
+            overlap=bounded_overlap,
+            now=now,
+        )
+
+    def list_operator_tokens(self, operator_id: str) -> tuple[OperatorTokenRecord, ...]:
+        if self._store.get_operator(operator_id) is None:
+            raise ControlNotFound("Operator not found")
+        return self._store.list_operator_token_records(operator_id)
+
+    def create_admin_session(
+        self,
+        operator_access_token: str,
+        *,
+        now: datetime | None = None,
+    ) -> IssuedAdminSession:
+        session = self._operator_tokens.authenticate(operator_access_token, now=now)
+        operator = self.inspect_operator(session.operator_id)
+        if not operator.active or not operator.roles:
+            raise AuthenticationError("Active Operator with roles not found")
+        return self._admin_sessions.create(
+            OperatorSession(
+                operator_id=operator.operator_id,
+                roles=operator.roles,
+                token_id=session.token_id,
+            ),
+            now=now,
+        )
+
+    def authenticate_admin_session(
+        self,
+        session_token: str,
+        *,
+        csrf_token: str | None = None,
+        require_csrf: bool = False,
+        now: datetime | None = None,
+    ) -> OperatorSession:
+        session = self._admin_sessions.authenticate(
+            session_token,
+            csrf_token=csrf_token,
+            require_csrf=require_csrf,
+            now=now,
+        )
+        operator = self.inspect_operator(session.operator_id)
+        if not operator.active or not operator.roles:
+            raise AuthenticationError("Active Operator with roles not found")
+        return OperatorSession(
+            operator_id=operator.operator_id,
+            roles=operator.roles,
+            token_id=session.token_id,
+            session_id=session.session_id,
+        )
+
+    def revoke_admin_session(self, session_id: str) -> bool:
+        return self._admin_sessions.revoke(session_id)
+
+    def record_operator_audit_event(
+        self,
+        session: OperatorSession,
+        *,
+        action: str,
+        target_type: str,
+        target_ids: dict[str, str],
+        outcome: str = "succeeded",
+        request_ref: str | None = None,
+        before_metadata: dict[str, str] | None = None,
+        after_metadata: dict[str, str] | None = None,
+    ) -> OperatorAuditEvent:
+        event = create_operator_audit_event(
+            session,
+            action=action,
+            target_type=target_type,
+            target_ids=target_ids,
+            outcome=outcome,
+            request_ref=request_ref,
+            before_metadata=before_metadata,
+            after_metadata=after_metadata,
+        )
+        self._store.save_operator_audit_event(event)
+        return event
+
+    def list_operator_audit_events(self, *, limit: int = 100) -> tuple[OperatorAuditEvent, ...]:
+        if limit < 1 or limit > 500:
+            raise ValueError("Operator Audit Event limit must be between 1 and 500")
+        return self._store.list_operator_audit_events(limit=limit)
+
+    def create_provisioning_job(
+        self,
+        session: OperatorSession,
+        manifest: TenantManifest,
+        *,
+        idempotency_key: str,
+    ) -> ProvisioningJobRecord:
+        if not idempotency_key.strip():
+            raise ValueError("Provisioning Job idempotency key cannot be empty")
+        job = self._store.create_provisioning_job(
+            new_provisioning_job(
+                manifest,
+                idempotency_key=idempotency_key,
+                requested_by_operator_id=session.operator_id,
+            )
+        )
+        self.record_operator_audit_event(
+            session,
+            action="provisioning_job.create",
+            target_type="provisioning_job",
+            target_ids={"job_id": job.job_id, "tenant_id": job.tenant_id},
+        )
+        return job
+
+    def list_provisioning_jobs(self) -> tuple[ProvisioningJobRecord, ...]:
+        return self._store.list_provisioning_jobs()
+
+    def cancel_provisioning_job(
+        self,
+        session: OperatorSession,
+        job_id: str,
+    ) -> ProvisioningJobRecord:
+        job = self._store.get_provisioning_job(job_id)
+        if job is None:
+            raise ControlNotFound("Provisioning Job not found")
+        if job.state not in {ProvisioningJobState.QUEUED, ProvisioningJobState.RUNNING}:
+            raise ValueError("Only queued or running Provisioning Jobs can be canceled")
+        updated = self._store.update_provisioning_job_state(
+            job_id,
+            state=ProvisioningJobState.CANCEL_REQUESTED,
+            changed_at=datetime.now(UTC),
+        )
+        self.record_operator_audit_event(
+            session,
+            action="provisioning_job.cancel_requested",
+            target_type="provisioning_job",
+            target_ids={"job_id": updated.job_id, "tenant_id": updated.tenant_id},
+        )
+        return updated
 
     def create_tenant(self, tenant_id: str, name: str) -> TenantRecord:
         record = TenantRecord(tenant_id=tenant_id, name=name)
         self._store.add_tenant(record)
         return record
+
+    def list_tenants(self) -> tuple[TenantRecord, ...]:
+        return self._store.list_tenants()
 
     def create_principal(self, principal_id: str, name: str, kind: str) -> PrincipalRecord:
         record = PrincipalRecord(

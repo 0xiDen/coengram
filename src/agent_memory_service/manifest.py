@@ -8,8 +8,8 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_memory_service.control import VALID_ROLES
 from agent_memory_service.models import PrincipalKind
+from agent_memory_service.roles import VALID_ROLES
 
 _SAFE_ID_PATTERN = r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$"
 _POSTGRES_NAME_PATTERN = r"^[a-z][a-z0-9_]*$"
