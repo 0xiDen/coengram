@@ -31,6 +31,7 @@ import {
   TableContainer,
   Tbody,
   Td,
+  Textarea,
   Text,
   Th,
   Thead,
@@ -42,7 +43,9 @@ import {
 import {
   Activity,
   Ban,
+  BrainCircuit,
   Building2,
+  CheckCircle2,
   ClipboardList,
   Copy,
   KeyRound,
@@ -53,7 +56,8 @@ import {
   RotateCcw,
   ScrollText,
   ShieldCheck,
-  Users
+  Users,
+  XCircle
 } from "lucide-react";
 import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 
@@ -72,6 +76,7 @@ import {
   loadAdminData,
   login,
   logout,
+  reviewKnowledgeCandidate,
   revokeOperatorToken,
   revokeToken,
   rotateOperatorToken,
@@ -93,6 +98,7 @@ import type {
 type PageKey =
   | "dashboard"
   | "tenants"
+  | "knowledge"
   | "identity"
   | "tokens"
   | "operators"
@@ -102,6 +108,7 @@ type PageKey =
 const NAV_ITEMS: Array<{ key: PageKey; label: string; icon: JSX.Element }> = [
   { key: "dashboard", label: "Dashboard", icon: <LayoutDashboard size={18} /> },
   { key: "tenants", label: "Tenants", icon: <Building2 size={18} /> },
+  { key: "knowledge", label: "Knowledge", icon: <BrainCircuit size={18} /> },
   { key: "identity", label: "Identity", icon: <Users size={18} /> },
   { key: "tokens", label: "Tokens", icon: <KeyRound size={18} /> },
   { key: "operators", label: "Operators", icon: <ShieldCheck size={18} /> },
@@ -114,6 +121,7 @@ const EMPTY_DATA: AdminData = {
   operators: [],
   principals: [],
   memberships: [],
+  knowledgeCandidates: [],
   provisioningJobs: [],
   auditEvents: []
 };
@@ -324,6 +332,9 @@ function AdminShell({
       {page === "tenants" ? (
         <TenantsPage csrf={csrf} data={data} onRefresh={refresh} onCredential={setCredential} />
       ) : null}
+      {page === "knowledge" ? (
+        <KnowledgePage csrf={csrf} data={data} onRefresh={refresh} />
+      ) : null}
       {page === "identity" ? (
         <IdentityPage csrf={csrf} data={data} onRefresh={refresh} onCredential={setCredential} />
       ) : null}
@@ -477,12 +488,13 @@ function PageBoundary({
 }
 
 function DashboardPage({ data }: { data: AdminData }) {
-  const runningJobs = data.provisioningJobs.filter((job) => job.state === "running").length;
-  const failedJobs = data.provisioningJobs.filter((job) => job.state === "failed").length;
   const expiringOperators = data.operators.filter((operator) => operator.active).length;
   const queue = data.provisioningJobs.filter((job) =>
     ["queued", "running", "failed", "cancel_requested"].includes(job.state)
   );
+  const pendingCandidates = data.knowledgeCandidates.filter(
+    (candidate) => candidate.status === "submitted"
+  ).length;
 
   return (
     <VStack align="stretch" spacing={6}>
@@ -490,7 +502,7 @@ function DashboardPage({ data }: { data: AdminData }) {
         <StatCard label="Tenants" value={data.tenants.length} helper={`${activeCount(data.tenants)} active`} />
         <StatCard label="Operators" value={data.operators.length} helper={`${expiringOperators} active`} />
         <StatCard label="Principals" value={data.principals.length} helper={`${activeCount(data.principals)} active`} />
-        <StatCard label="Jobs" value={queue.length} helper={`${failedJobs} failed, ${runningJobs} running`} />
+        <StatCard label="Knowledge" value={pendingCandidates} helper="pending review" />
       </SimpleGrid>
       <Panel title="Action Queue" icon={<ClipboardList size={18} />}>
         <TableView
@@ -623,6 +635,204 @@ function TenantsPage({
               Queue Job
             </Button>
           </Stack>
+        </Panel>
+      </GridItem>
+    </Grid>
+  );
+}
+
+function KnowledgePage({
+  csrf,
+  data,
+  onRefresh
+}: {
+  csrf: string | null;
+  data: AdminData;
+  onRefresh: () => Promise<void>;
+}) {
+  const toast = useToast();
+  const [tenantId, setTenantId] = useState(data.tenants[0]?.tenant_id ?? "");
+  const [selectedId, setSelectedId] = useState("");
+  const [rationale, setRationale] = useState("Reviewed from Operator admin panel.");
+  const [busyDecision, setBusyDecision] = useState<"approve" | "reject" | null>(null);
+
+  useEffect(() => {
+    if (!tenantId && data.tenants[0]) {
+      setTenantId(data.tenants[0].tenant_id);
+    }
+  }, [data.tenants, tenantId]);
+
+  const candidates = useMemo(
+    () =>
+      data.knowledgeCandidates.filter((candidate) => candidate.tenant_id === tenantId),
+    [data.knowledgeCandidates, tenantId]
+  );
+
+  useEffect(() => {
+    if (!candidates.some((candidate) => candidate.id === selectedId)) {
+      setSelectedId(candidates[0]?.id ?? "");
+    }
+  }, [candidates, selectedId]);
+
+  const selected = candidates.find((candidate) => candidate.id === selectedId) ?? null;
+
+  async function review(decision: "approve" | "reject") {
+    if (!selected || !tenantId) {
+      return;
+    }
+    setBusyDecision(decision);
+    try {
+      const reviewed = await reviewKnowledgeCandidate(csrf, tenantId, selected.id, {
+        decision,
+        rationale,
+        idempotency_key: idempotencyKey(`knowledge-${decision}`)
+      });
+      toast({
+        status: "success",
+        title: `${shortId(reviewed.id)} ${reviewed.status}`
+      });
+      await onRefresh();
+    } catch (exc) {
+      toast({ status: "error", title: errorMessage(exc) });
+    } finally {
+      setBusyDecision(null);
+    }
+  }
+
+  return (
+    <Grid templateColumns={{ base: "1fr", xl: "minmax(0, 1fr) 420px" }} gap={5}>
+      <GridItem>
+        <Panel title="Knowledge Candidates" icon={<BrainCircuit size={18} />}>
+          <SimpleGrid columns={{ base: 1, md: 3 }} spacing={4} mb={5}>
+            <FormControl>
+              <FormLabel>Tenant</FormLabel>
+              <Select value={tenantId} onChange={(event) => setTenantId(event.target.value)}>
+                {data.tenants.map((tenant) => (
+                  <option key={tenant.tenant_id} value={tenant.tenant_id}>
+                    {tenant.name}
+                  </option>
+                ))}
+              </Select>
+            </FormControl>
+            <Stat>
+              <StatLabel color="ink.500">Submitted</StatLabel>
+              <StatNumber fontSize="2xl">
+                {candidates.filter((candidate) => candidate.status === "submitted").length}
+              </StatNumber>
+            </Stat>
+            <Stat>
+              <StatLabel color="ink.500">Total</StatLabel>
+              <StatNumber fontSize="2xl">{candidates.length}</StatNumber>
+            </Stat>
+          </SimpleGrid>
+          <TableView
+            headers={["Candidate", "Status", "Confidence", "Proposer", "Sources", ""]}
+            empty="No Knowledge Candidates"
+            rows={candidates.map((candidate) => [
+              <Text key="claim" noOfLines={2} maxW="520px">
+                {candidate.claim}
+              </Text>,
+              <StatusBadge key="status" value={candidate.status} />,
+              `${Math.round(candidate.confidence * 100)}%`,
+              <Code key="proposer">{shortId(candidate.proposer_id)}</Code>,
+              candidate.source_count,
+              <HStack key="actions" justify="end">
+                <Button
+                  size="sm"
+                  variant={candidate.id === selectedId ? "solid" : "outline"}
+                  leftIcon={<BrainCircuit size={14} />}
+                  onClick={() => setSelectedId(candidate.id)}
+                >
+                  Review
+                </Button>
+              </HStack>
+            ])}
+          />
+        </Panel>
+      </GridItem>
+      <GridItem>
+        <Panel title="Review" icon={<CheckCircle2 size={18} />}>
+          {selected ? (
+            <Stack spacing={4}>
+              <Box>
+                <Text fontSize="xs" color="ink.500" mb={1}>
+                  Candidate
+                </Text>
+                <Code>{shortId(selected.id)}</Code>
+              </Box>
+              <Box>
+                <Text fontSize="xs" color="ink.500" mb={1}>
+                  Claim
+                </Text>
+                <Text fontWeight={600}>{selected.claim}</Text>
+              </Box>
+              <SimpleGrid columns={2} spacing={3}>
+                <Box>
+                  <Text fontSize="xs" color="ink.500">
+                    Status
+                  </Text>
+                  <StatusBadge value={selected.status} />
+                </Box>
+                <Box>
+                  <Text fontSize="xs" color="ink.500">
+                    Created
+                  </Text>
+                  <Text fontSize="sm">{formatDate(selected.created_at)}</Text>
+                </Box>
+                <Box>
+                  <Text fontSize="xs" color="ink.500">
+                    Duplicates
+                  </Text>
+                  <Text fontSize="sm">{selected.duplicate_memory_ids.length}</Text>
+                </Box>
+                <Box>
+                  <Text fontSize="xs" color="ink.500">
+                    Conflicts
+                  </Text>
+                  <Text fontSize="sm">{selected.conflicting_memory_ids.length}</Text>
+                </Box>
+              </SimpleGrid>
+              {selected.reviewed_by ? (
+                <Alert status="info" borderRadius="8px">
+                  <AlertIcon />
+                  <Text fontSize="sm">Reviewed by {selected.reviewed_by}</Text>
+                </Alert>
+              ) : null}
+              <FormControl isDisabled={selected.status !== "submitted"}>
+                <FormLabel>Rationale</FormLabel>
+                <Textarea
+                  minH="130px"
+                  resize="vertical"
+                  value={rationale}
+                  onChange={(event) => setRationale(event.target.value)}
+                />
+              </FormControl>
+              <HStack justify="end">
+                <Button
+                  leftIcon={<XCircle size={16} />}
+                  colorScheme="red"
+                  variant="outline"
+                  isDisabled={selected.status !== "submitted"}
+                  isLoading={busyDecision === "reject"}
+                  onClick={() => review("reject")}
+                >
+                  Reject
+                </Button>
+                <Button
+                  leftIcon={<CheckCircle2 size={16} />}
+                  isDisabled={selected.status !== "submitted"}
+                  isLoading={busyDecision === "approve"}
+                  onClick={() => review("approve")}
+                >
+                  Approve
+                </Button>
+              </HStack>
+            </Stack>
+          ) : (
+            <Flex align="center" justify="center" minH="260px">
+              <Text color="ink.500">No candidate selected</Text>
+            </Flex>
+          )}
         </Panel>
       </GridItem>
     </Grid>
@@ -1400,6 +1610,10 @@ function shortId(value: string) {
 
 function activeCount(items: Array<{ active: boolean }>) {
   return items.filter((item) => item.active).length;
+}
+
+function idempotencyKey(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function targetLabel(targetIds: Record<string, string>) {

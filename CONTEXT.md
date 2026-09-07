@@ -57,6 +57,14 @@ _Avoid_: Admin worker, provisioning sidecar, gateway shell
 A structured, content-safe record of an Operator action, including the Operator, role context, action, target identifiers, request identity, timing, and safe before/after metadata. It never stores Access Token secrets or Private Memory content.
 _Avoid_: Admin log, activity row, raw request log
 
+**Support Lens**:
+An audited Operator view over explicit tenant metadata and governance records for diagnosis. It is not a User session and does not grant access to a User's Private Memory content.
+_Avoid_: Impersonation, login as user, act-as user
+
+**Operator Knowledge Review**:
+An audited Operator decision on a Knowledge Candidate through the admin plane. It records the Operator as the reviewer without granting that Operator Tenant Membership or Private Memory access.
+_Avoid_: Curator impersonation, admin promotion shortcut
+
 **Tenant Manifest**:
 A versioned, secret-free representation of Tenants, Principals, Tenant Memberships, roles, and policies for validation, export, and idempotent import. Access Tokens are reissued after import rather than included in a manifest.
 _Avoid_: Configuration export, tenant backup

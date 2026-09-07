@@ -161,7 +161,7 @@ def create_http_app(
             )
 
     if control is not None:
-        mount_admin_routes(app, control)
+        mount_admin_routes(app, control, memory=memory)
 
     @app.post(
         "/api/v1/memories",

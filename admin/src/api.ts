@@ -3,6 +3,7 @@ import type {
   AdminSession,
   AuditEvent,
   Credential,
+  KnowledgeCandidate,
   Membership,
   Operator,
   OperatorTokenRecord,
@@ -107,12 +108,27 @@ export async function loadAdminData(): Promise<AdminData> {
     optional(request<{ jobs: ProvisioningJob[] }>("/provisioning-jobs"), { jobs: [] }),
     optional(request<{ events: AuditEvent[] }>("/audit-events"), { events: [] })
   ]);
+  const knowledgeCandidates = await Promise.all(
+    tenants.tenants.map(async (tenant) => {
+      const result = await optional(
+        request<{ candidates: KnowledgeCandidate[] }>(
+          `/tenants/${encodeURIComponent(tenant.tenant_id)}/knowledge-candidates`
+        ),
+        { candidates: [] }
+      );
+      return result.candidates.map((candidate) => ({
+        ...candidate,
+        tenant_id: tenant.tenant_id
+      }));
+    })
+  );
 
   return {
     tenants: tenants.tenants,
     operators: operators.operators,
     principals: principals.principals,
     memberships: principals.memberships,
+    knowledgeCandidates: knowledgeCandidates.flat(),
     provisioningJobs: provisioningJobs.jobs,
     auditEvents: auditEvents.events
   };
@@ -220,6 +236,24 @@ export async function rotateToken(
 
 export async function revokeToken(csrf: string | null, tokenId: string): Promise<void> {
   return request<void>(`/tokens/${tokenId}`, { method: "DELETE", csrf });
+}
+
+export async function reviewKnowledgeCandidate(
+  csrf: string | null,
+  tenantId: string,
+  candidateId: string,
+  body: { decision: "approve" | "reject"; rationale: string; idempotency_key: string }
+): Promise<KnowledgeCandidate> {
+  return request<KnowledgeCandidate>(
+    `/tenants/${encodeURIComponent(tenantId)}/knowledge-candidates/${encodeURIComponent(
+      candidateId
+    )}/reviews`,
+    {
+      method: "POST",
+      csrf,
+      body
+    }
+  );
 }
 
 export async function createProvisioningJob(

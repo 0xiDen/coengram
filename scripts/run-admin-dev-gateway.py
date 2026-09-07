@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import uvicorn
 
 from agent_memory_service.auth import TokenService
 from agent_memory_service.control import ControlModule, InMemoryControlStore
+from agent_memory_service.governance import InMemoryGovernanceStore, ProposeKnowledge
 from agent_memory_service.http import create_http_app
 from agent_memory_service.memory import MemoryModule
+from agent_memory_service.models import MemoryKind, PrincipalKind, RetainMemory, TenantSession
 from agent_memory_service.stores.memory import InMemoryTenantMemoryRouter
 
 
@@ -37,14 +40,41 @@ def main() -> None:
         "operator-dev",
         lifetime=timedelta(days=7),
     )
-    app = create_http_app(
-        MemoryModule(InMemoryTenantMemoryRouter(["tenant-a"])),
-        tokens,
-        control=control,
+    memory = MemoryModule(
+        InMemoryTenantMemoryRouter(["tenant-a"]),
+        InMemoryGovernanceStore(),
     )
+    asyncio.run(_seed_candidate(memory))
+    app = create_http_app(memory, tokens, control=control)
     print("Admin dev Operator Access Token:", flush=True)
     print(credential.access_token, flush=True)
     uvicorn.run(app, host="127.0.0.1", port=8080, access_log=False)
+
+
+async def _seed_candidate(memory: MemoryModule) -> None:
+    session = TenantSession(
+        tenant_id="tenant-a",
+        actor_id="user-alice",
+        actor_kind=PrincipalKind.USER,
+        roles=frozenset({"tenant_member"}),
+    )
+    source = await memory.retain(
+        session,
+        RetainMemory(
+            content="Private rollout note for Product A.",
+            kind=MemoryKind.CONSTRAINT,
+            idempotency_key="admin-dev-private-source",
+        ),
+    )
+    await memory.propose_knowledge(
+        session,
+        ProposeKnowledge(
+            claim="Product A uses guarded rollouts for risky changes.",
+            source_memory_ids=(source.id,),
+            confidence=0.91,
+            idempotency_key="admin-dev-knowledge-candidate",
+        ),
+    )
 
 
 if __name__ == "__main__":

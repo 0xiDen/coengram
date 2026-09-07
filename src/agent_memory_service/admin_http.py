@@ -17,7 +17,13 @@ from agent_memory_service.control import (
     OperatorRecord,
     PrincipalRecord,
 )
+from agent_memory_service.governance import (
+    KnowledgeCandidateView,
+    ReviewDecision,
+    ReviewKnowledge,
+)
 from agent_memory_service.manifest import TenantManifest
+from agent_memory_service.memory import MemoryModule
 from agent_memory_service.operator_audit import OperatorAuditEventView, operator_audit_event_view
 from agent_memory_service.operator_auth import (
     IssuedAdminSession,
@@ -33,7 +39,14 @@ ADMIN_SESSION_COOKIE = "coengram_admin_session"
 ADMIN_CSRF_HEADER = "X-CoEngram-CSRF"
 ADMIN_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
 TENANT_VISIBLE_ROLES = frozenset(
-    {"tenant_provisioner", "tenant_support", "identity_admin", "audit_viewer", "operator_admin"}
+    {
+        "tenant_provisioner",
+        "tenant_support",
+        "identity_admin",
+        "knowledge_admin",
+        "audit_viewer",
+        "operator_admin",
+    }
 )
 IDENTITY_MUTATION_ROLES = frozenset({"identity_admin", "operator_admin"})
 AUDIT_VISIBLE_ROLES = frozenset({"audit_viewer", "operator_admin"})
@@ -47,6 +60,7 @@ IDENTITY_VISIBLE_ROLES = frozenset(
 )
 TOKEN_VISIBLE_ROLES = frozenset({"token_admin", "audit_viewer", "operator_admin"})
 TOKEN_MUTATION_ROLES = frozenset({"token_admin", "operator_admin"})
+KNOWLEDGE_ROLES = frozenset({"knowledge_admin", "operator_admin"})
 
 
 class AdminLoginBody(BaseModel):
@@ -263,13 +277,32 @@ class ProvisioningJobListView(BaseModel):
     jobs: tuple[ProvisioningJobView, ...]
 
 
+class KnowledgeCandidateListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    candidates: tuple[KnowledgeCandidateView, ...]
+
+
+class ReviewKnowledgeCandidateBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    decision: ReviewDecision
+    rationale: str = Field(min_length=1, max_length=4_000)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+
+
 class OperatorAuditEventListView(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     events: tuple[OperatorAuditEventView, ...]
 
 
-def mount_admin_routes(app: FastAPI, control: ControlModule) -> None:
+def mount_admin_routes(
+    app: FastAPI,
+    control: ControlModule,
+    *,
+    memory: MemoryModule | None = None,
+) -> None:
     """Mount Operator-admin routes onto the shared gateway app."""
 
     @app.post(
@@ -688,6 +721,74 @@ def mount_admin_routes(app: FastAPI, control: ControlModule) -> None:
         response.status_code = status.HTTP_204_NO_CONTENT
         return response
 
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-candidates",
+        response_model=KnowledgeCandidateListView,
+    )
+    async def list_admin_knowledge_candidates(
+        tenant_id: str,
+        request: Request,
+    ) -> KnowledgeCandidateListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, KNOWLEDGE_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidates = await module.list_operator_knowledge_candidates(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        return KnowledgeCandidateListView(candidates=candidates)
+
+    @app.post(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-candidates/{candidate_id}/reviews",
+        response_model=KnowledgeCandidateView,
+    )
+    async def review_admin_knowledge_candidate(
+        tenant_id: str,
+        candidate_id: str,
+        body: ReviewKnowledgeCandidateBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> KnowledgeCandidateView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, KNOWLEDGE_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidate = await module.review_operator_knowledge(
+                tenant_id,
+                session.operator_id,
+                ReviewKnowledge(candidate_id=candidate_id, **body.model_dump()),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="knowledge_candidate.review",
+            target_type="knowledge_candidate",
+            target_ids={"tenant_id": tenant_id, "candidate_id": candidate_id},
+            after_metadata={
+                "decision": body.decision.value,
+                "status": candidate.status.value,
+            },
+        )
+        return candidate
+
     @app.post(
         "/api/v1/admin/provisioning-jobs",
         response_model=ProvisioningJobView,
@@ -799,6 +900,15 @@ def _authenticate_request(
         ) from exc
 
 
+def _require_memory(memory: MemoryModule | None) -> MemoryModule:
+    if memory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant Memory is not available",
+        )
+    return memory
+
+
 def _set_session_cookie(response: Response, session_token: str) -> None:
     response.set_cookie(
         ADMIN_SESSION_COOKIE,
@@ -894,6 +1004,11 @@ def _operator_token_record_view(record: OperatorTokenRecord) -> OperatorTokenRec
 def _require_roles(session: OperatorSession, allowed: frozenset[str]) -> None:
     if not session.roles.intersection(allowed):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def _require_tenant(control: ControlModule, tenant_id: str) -> None:
+    if not any(tenant.tenant_id == tenant_id for tenant in control.list_tenants()):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
 
 
 def _credential_view(credential: object) -> CredentialView:

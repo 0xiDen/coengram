@@ -93,6 +93,21 @@ export type ProvisioningJob = {
   updated_at: string;
 };
 
+export type KnowledgeCandidate = {
+  id: string;
+  tenant_id?: string;
+  claim: string;
+  confidence: number;
+  proposer_id: string;
+  source_count: number;
+  duplicate_memory_ids: string[];
+  conflicting_memory_ids: string[];
+  status: string;
+  created_at: string;
+  reviewed_by: string | null;
+  review_rationale: string | null;
+};
+
 export type AuditEvent = {
   event_id: string;
   operator_id: string;
@@ -112,6 +127,7 @@ export type AdminData = {
   operators: Operator[];
   principals: Principal[];
   memberships: Membership[];
+  knowledgeCandidates: KnowledgeCandidate[];
   provisioningJobs: ProvisioningJob[];
   auditEvents: AuditEvent[];
 };

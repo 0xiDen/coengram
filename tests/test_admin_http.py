@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 from fastapi.testclient import TestClient
 
 from agent_memory_service.auth import TokenService
 from agent_memory_service.control import ControlModule, InMemoryControlStore
+from agent_memory_service.governance import InMemoryGovernanceStore, ProposeKnowledge
 from agent_memory_service.http import create_http_app
 from agent_memory_service.memory import MemoryModule
+from agent_memory_service.models import PrincipalKind, RetainMemory, TenantSession
 from agent_memory_service.stores.memory import InMemoryTenantMemoryRouter
 
 
@@ -312,6 +315,136 @@ def test_admin_can_list_principals_and_manage_principal_tokens() -> None:
         headers={"X-CoEngram-CSRF": csrf_token},
     )
     assert revoked.status_code == 204
+
+
+def test_admin_can_review_knowledge_candidates_without_private_sources_in_audit() -> None:
+    store = InMemoryControlStore()
+    control = ControlModule(store, TokenService(store))
+    control.create_tenant("tenant-a", "Product A")
+    control.create_operator(
+        "operator-knowledge",
+        "Knowledge",
+        frozenset({"audit_viewer", "knowledge_admin"}),
+    )
+    credential = control.issue_operator_access_token("operator-knowledge")
+    memory = MemoryModule(
+        InMemoryTenantMemoryRouter(["tenant-a"]),
+        InMemoryGovernanceStore(),
+    )
+
+    async def seed_candidate() -> str:
+        session = TenantSession(
+            tenant_id="tenant-a",
+            actor_id="user-alice",
+            actor_kind=PrincipalKind.USER,
+            roles=frozenset({"tenant_member"}),
+        )
+        source = await memory.retain(
+            session,
+            RetainMemory(
+                content="Private deployment detail for candidate review.",
+                idempotency_key="admin-knowledge-source",
+            ),
+        )
+        candidate = await memory.propose_knowledge(
+            session,
+            ProposeKnowledge(
+                claim="Product A deploys with a guarded rollout.",
+                source_memory_ids=(source.id,),
+                idempotency_key="admin-knowledge-candidate",
+            ),
+        )
+        return candidate.id
+
+    candidate_id = asyncio.run(seed_candidate())
+    client = TestClient(create_http_app(memory, TokenService(store), control=control))
+    login = client.post("/api/v1/admin/session", json={"access_token": credential.access_token})
+    csrf_token = login.json()["csrf_token"]
+
+    listed = client.get("/api/v1/admin/tenants/tenant-a/knowledge-candidates")
+    missing_csrf = client.post(
+        f"/api/v1/admin/tenants/tenant-a/knowledge-candidates/{candidate_id}/reviews",
+        json={
+            "decision": "approve",
+            "rationale": "Confirmed by release owner.",
+            "idempotency_key": "admin-knowledge-review-missing-csrf",
+        },
+    )
+    reviewed = client.post(
+        f"/api/v1/admin/tenants/tenant-a/knowledge-candidates/{candidate_id}/reviews",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "decision": "approve",
+            "rationale": "Confirmed by release owner.",
+            "idempotency_key": "admin-knowledge-review",
+        },
+    )
+
+    assert listed.status_code == 200
+    listed_body = listed.json()
+    assert listed_body["candidates"][0]["id"] == candidate_id
+    assert listed_body["candidates"][0]["source_count"] == 1
+    assert "source_memory_ids" not in listed.text
+    assert missing_csrf.status_code == 401
+    assert reviewed.status_code == 200
+    assert reviewed.json()["status"] == "publishing"
+    assert reviewed.json()["reviewed_by"] == "operator:operator-knowledge"
+
+    audit = client.get("/api/v1/admin/audit-events")
+    assert audit.status_code == 200
+    event = audit.json()["events"][0]
+    assert event["action"] == "knowledge_candidate.review"
+    assert event["target_ids"] == {"candidate_id": candidate_id, "tenant_id": "tenant-a"}
+    assert event["after_metadata"] == {"decision": "approve", "status": "publishing"}
+    assert "Private deployment detail" not in audit.text
+    assert "Confirmed by release owner" not in audit.text
+
+
+def test_knowledge_candidate_admin_routes_require_knowledge_admin_role() -> None:
+    store = InMemoryControlStore()
+    control = ControlModule(store, TokenService(store))
+    control.create_operator("operator-support", "Support", frozenset({"tenant_support"}))
+    credential = control.issue_operator_access_token("operator-support")
+    app = create_http_app(
+        MemoryModule(InMemoryTenantMemoryRouter(["tenant-a"]), InMemoryGovernanceStore()),
+        TokenService(store),
+        control=control,
+    )
+    client = TestClient(app)
+    login = client.post("/api/v1/admin/session", json={"access_token": credential.access_token})
+    csrf_token = login.json()["csrf_token"]
+
+    listed = client.get("/api/v1/admin/tenants/tenant-a/knowledge-candidates")
+    reviewed = client.post(
+        "/api/v1/admin/tenants/tenant-a/knowledge-candidates/candidate-a/reviews",
+        headers={"X-CoEngram-CSRF": csrf_token},
+        json={
+            "decision": "reject",
+            "rationale": "Not verified.",
+            "idempotency_key": "support-review-denied",
+        },
+    )
+
+    assert listed.status_code == 403
+    assert reviewed.status_code == 403
+
+
+def test_knowledge_candidate_admin_routes_reject_unknown_tenant() -> None:
+    store = InMemoryControlStore()
+    control = ControlModule(store, TokenService(store))
+    control.create_operator("operator-knowledge", "Knowledge", frozenset({"knowledge_admin"}))
+    credential = control.issue_operator_access_token("operator-knowledge")
+    app = create_http_app(
+        MemoryModule(InMemoryTenantMemoryRouter(["tenant-a"]), InMemoryGovernanceStore()),
+        TokenService(store),
+        control=control,
+    )
+    client = TestClient(app)
+    client.post("/api/v1/admin/session", json={"access_token": credential.access_token})
+
+    listed = client.get("/api/v1/admin/tenants/tenant-missing/knowledge-candidates")
+
+    assert listed.status_code == 404
 
 
 def test_admin_user_onboarding_requires_identity_role_and_csrf() -> None:

@@ -175,6 +175,16 @@ Completed locally:
 - React/Vite/Chakra admin frontend served in development by Vite and in production by
   Caddy at `/admin/`.
 
+Second slice completed locally:
+
+- Operator-facing Knowledge Candidate list/review API under tenant-scoped admin routes.
+- `knowledge_admin` role support for tenant visibility and candidate review.
+- Content-safe Operator Audit Events for Knowledge Candidate decisions.
+- Chakra Knowledge page with tenant filtering, candidate status scanning, and approve/reject
+  actions.
+- Support Lens ADR recording why future user troubleshooting must not become literal
+  Operator impersonation by default.
+
 Validation blockers:
 
 - Full-suite Docker proxy integration cannot run until Docker is reachable locally.

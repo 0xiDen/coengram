@@ -193,6 +193,34 @@ class MemoryModule:
             for candidate in await governance.list_candidates(session.tenant_id)
         )
 
+    async def list_operator_knowledge_candidates(
+        self,
+        tenant_id: str,
+    ) -> tuple[KnowledgeCandidateView, ...]:
+        """Expose privacy-safe Knowledge Candidates to the Operator admin plane."""
+
+        governance = self._require_governance()
+        return tuple(
+            candidate_view(candidate)
+            for candidate in await governance.list_candidates(tenant_id)
+        )
+
+    async def review_operator_knowledge(
+        self,
+        tenant_id: str,
+        operator_id: str,
+        command: ReviewKnowledge,
+    ) -> KnowledgeCandidateView:
+        """Apply an Operator-admin review without granting tenant-scoped Principal access."""
+
+        governance = self._require_governance()
+        candidate = await governance.get_candidate(tenant_id, command.candidate_id)
+        if candidate is None:
+            raise LookupError("Knowledge Candidate not found")
+        return candidate_view(
+            await governance.review(tenant_id, f"operator:{operator_id}", command)
+        )
+
     async def publish_next(self, tenant_id: str) -> KnowledgeCandidateView | None:
         governance = self._require_governance()
         event = await governance.next_publication(tenant_id)
