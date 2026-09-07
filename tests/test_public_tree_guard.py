@@ -47,4 +47,7 @@ def test_public_dependency_hosts_are_explicitly_allowlisted() -> None:
 
     assert "huggingface.co" in guard.ALLOWED_HOSTS
     assert "apt.postgresql.org" in guard.ALLOWED_HOSTS
+    assert "registry.npmjs.org" in guard.ALLOWED_HOSTS
+    assert "opencollective.com" in guard.ALLOWED_HOSTS
+    assert "tidelift.com" in guard.ALLOWED_HOSTS
     assert ("private-deployment" + "." + "online") not in guard.ALLOWED_HOSTS
