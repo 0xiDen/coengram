@@ -193,6 +193,72 @@ class MemoryModule:
             for candidate in await governance.list_candidates(session.tenant_id)
         )
 
+    async def list_operator_knowledge_candidates(
+        self,
+        tenant_id: str,
+    ) -> tuple[KnowledgeCandidateView, ...]:
+        """Expose privacy-safe Knowledge Candidates to the Operator admin plane."""
+
+        governance = self._require_governance()
+        return tuple(
+            candidate_view(candidate) for candidate in await governance.list_candidates(tenant_id)
+        )
+
+    async def review_operator_knowledge(
+        self,
+        tenant_id: str,
+        operator_id: str,
+        command: ReviewKnowledge,
+    ) -> KnowledgeCandidateView:
+        """Apply an Operator-admin review without granting tenant-scoped Principal access."""
+
+        governance = self._require_governance()
+        candidate = await governance.get_candidate(tenant_id, command.candidate_id)
+        if candidate is None:
+            raise LookupError("Knowledge Candidate not found")
+        return candidate_view(
+            await governance.review(tenant_id, f"operator:{operator_id}", command)
+        )
+
+    async def list_operator_private_memory_metadata(
+        self,
+        tenant_id: str,
+        owner_principal_id: str,
+    ) -> tuple[PrivateMemoryInspection, ...]:
+        """Expose content-free Private Memory state for an audited Support Lens."""
+
+        if self._commands is not None:
+            inspections = await self._commands.list_private_memory_state(
+                tenant_id,
+                owner_principal_id,
+            )
+            return tuple(
+                inspection.model_copy(update={"content": None}) for inspection in inspections
+            )
+        items = await self._router.for_tenant(tenant_id).list_private(owner_principal_id)
+        return tuple(
+            PrivateMemoryInspection(
+                id=item.id,
+                owner_principal_id=owner_principal_id,
+                state=item.state,
+                mutation_state=MutationState.APPLIED,
+                content=None,
+                kind=item.kind,
+                confidence=item.confidence,
+                created_at=item.created_at,
+                supersedes_id=item.supersedes_id,
+            )
+            for item in items
+        )
+
+    async def list_operator_tenant_knowledge(
+        self,
+        tenant_id: str,
+    ) -> tuple[MemoryItem, ...]:
+        """Expose published Tenant Knowledge to the Operator admin plane."""
+
+        return await self._router.for_tenant(tenant_id).list_tenant_knowledge()
+
     async def publish_next(self, tenant_id: str) -> KnowledgeCandidateView | None:
         governance = self._require_governance()
         event = await governance.next_publication(tenant_id)

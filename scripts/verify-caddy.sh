@@ -18,6 +18,9 @@ trap cleanup EXIT INT TERM
 printf '%s\n' '0123456789abcdef0123456789abcdef01234567' \
   > "$secret_directory/cloudflare_api_token"
 printf '%s\n' 'memory.example.com' > "$secret_directory/memory_public_host"
+mkdir -p "$secret_directory/admin"
+printf '%s\n' '<!doctype html><title>CoEngram Admin</title>' \
+  > "$secret_directory/admin/index.html"
 chmod 0600 "$secret_directory/cloudflare_api_token" "$secret_directory/memory_public_host"
 
 docker run --rm --entrypoint caddy "$image_id" list-modules \
@@ -49,6 +52,7 @@ docker run --detach --name "$gateway_container" --network "$network" \
   python /test/fake-ingress-gateway.py >/dev/null
 docker run --detach --name "$caddy_container" --network "$network" \
   --publish 127.0.0.1::8080 \
+  --volume "$secret_directory/admin:/srv/coengram-admin:ro" \
   --entrypoint caddy \
   "$image_id" run --config /etc/caddy/Caddyfile.test --adapter caddyfile >/dev/null
 
@@ -91,6 +95,11 @@ curl --fail --silent --show-error \
   | grep -F '"surface":"oauth-protected-resource"' >/dev/null
 printf '%s\n' "PASS OAuth protected-resource metadata forwarded with authoritative headers stripped"
 
+curl --fail --silent --show-error \
+  "http://127.0.0.1:$caddy_port/admin/" \
+  | grep -F 'CoEngram Admin' >/dev/null
+printf '%s\n' "PASS admin panel static route served"
+
 dd if=/dev/zero of="$secret_directory/oversized-telegram-body" bs=1024 count=257 \
   >/dev/null 2>&1
 status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
@@ -117,7 +126,7 @@ if docker logs "$caddy_container" 2>&1 | grep -F "$private_test_host" >/dev/null
 fi
 printf '%s\n' "PASS secret hostname excluded from Caddy telemetry"
 
-for path in neo4j rabbitmq grafana metrics admin; do
+for path in neo4j rabbitmq grafana metrics; do
   status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
     --header 'Authorization: Bearer release-verification-token' \
     "http://127.0.0.1:$caddy_port/$path")"

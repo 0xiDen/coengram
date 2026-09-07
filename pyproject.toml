@@ -54,9 +54,11 @@ dependencies = [
 
 [project.scripts]
 coengram-gateway = "agent_memory_service.server:main"
+coengram-operator-service = "agent_memory_service.operator_service:main"
 coengram-worker = "agent_memory_service.worker:main"
 coengramctl = "agent_memory_service.cli:main"
 memory-gateway = "agent_memory_service.server:main"
+memory-operator-service = "agent_memory_service.operator_service:main"
 memory-worker = "agent_memory_service.worker:main"
 memoryctl = "agent_memory_service.cli:main"
 

@@ -10,7 +10,7 @@ from agent_memory_service.database_url import (
     psycopg_database_url as _psycopg_database_url,
 )
 
-CONTROL_SCHEMA_REVISION = "0007_backup_barriers"
+CONTROL_SCHEMA_REVISION = "0008_operator_admin_plane"
 TENANT_SCHEMA_REVISION = "0006_agent_run_context"
 
 

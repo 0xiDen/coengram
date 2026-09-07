@@ -114,6 +114,37 @@ def _parser() -> argparse.ArgumentParser:
     token_rotate.add_argument("--overlap-minutes", type=int, required=True)
     token_rotate.add_argument("--lifetime-days", type=int)
 
+    operator = resources.add_parser("operator").add_subparsers(dest="action", required=True)
+    operator_create = operator.add_parser("create")
+    operator_create.add_argument("--id", required=True)
+    operator_create.add_argument("--name", required=True)
+    operator_create.add_argument("--role", action="append", required=True)
+    operator.add_parser("list")
+    operator_inspect = operator.add_parser("inspect")
+    operator_inspect.add_argument("--id", required=True)
+    operator_update = operator.add_parser("update")
+    operator_update.add_argument("--id", required=True)
+    operator_update.add_argument("--name")
+    operator_update.add_argument("--role", action="append")
+    operator_update.add_argument("--active", choices=("true", "false"))
+    operator_disable = operator.add_parser("disable")
+    operator_disable.add_argument("--id", required=True)
+    operator_token = operator.add_parser("token").add_subparsers(
+        dest="token_action",
+        required=True,
+    )
+    operator_token_issue = operator_token.add_parser("issue")
+    operator_token_issue.add_argument("--operator-id", required=True)
+    operator_token_issue.add_argument("--lifetime-days", type=int)
+    operator_token_list = operator_token.add_parser("list")
+    operator_token_list.add_argument("--operator-id", required=True)
+    operator_token_revoke = operator_token.add_parser("revoke")
+    operator_token_revoke.add_argument("--token-id", required=True)
+    operator_token_rotate = operator_token.add_parser("rotate")
+    operator_token_rotate.add_argument("--token-id", required=True)
+    operator_token_rotate.add_argument("--overlap-minutes", type=int, required=True)
+    operator_token_rotate.add_argument("--lifetime-days", type=int)
+
     delegation = resources.add_parser("delegation").add_subparsers(dest="action", required=True)
     delegation_create = delegation.add_parser("create")
     delegation_create.add_argument("--id", required=True)
@@ -548,6 +579,88 @@ def run_cli(
             args.tenant_id, args.principal_id, args.role
         )
         _write(output, _membership_document(membership_record))
+    elif args.resource == "operator" and args.action == "create":
+        _write(
+            output,
+            _operator_document(
+                control.create_operator(
+                    args.id,
+                    args.name,
+                    frozenset(args.role),
+                )
+            ),
+        )
+    elif args.resource == "operator" and args.action == "list":
+        _write(
+            output,
+            {
+                "operators": [
+                    _operator_document(operator) for operator in control.list_operators()
+                ],
+            },
+        )
+    elif args.resource == "operator" and args.action == "inspect":
+        _write(output, _operator_document(control.inspect_operator(args.id)))
+    elif args.resource == "operator" and args.action == "update":
+        _write(
+            output,
+            _operator_document(
+                control.update_operator(
+                    args.id,
+                    name=args.name,
+                    roles=None if args.role is None else frozenset(args.role),
+                    active=None if args.active is None else args.active == "true",
+                )
+            ),
+        )
+    elif args.resource == "operator" and args.action == "disable":
+        _write(output, _operator_document(control.update_operator(args.id, active=False)))
+    elif args.resource == "operator" and args.action == "token":
+        if args.token_action == "issue":
+            lifetime = None if args.lifetime_days is None else timedelta(days=args.lifetime_days)
+            credential = control.issue_operator_access_token(
+                args.operator_id,
+                lifetime=lifetime,
+            )
+            _write(output, _credential_document(credential))
+        elif args.token_action == "list":
+            _write(
+                output,
+                {
+                    "operator_id": args.operator_id,
+                    "tokens": [
+                        _operator_token_document(record)
+                        for record in control.list_operator_tokens(args.operator_id)
+                    ],
+                },
+            )
+        elif args.token_action == "revoke":
+            _write(
+                output,
+                {
+                    "token_id": args.token_id,
+                    "revoked": control.revoke_operator_access_token(args.token_id),
+                },
+            )
+        elif args.token_action == "rotate":
+            replacement_lifetime = (
+                None if args.lifetime_days is None else timedelta(days=args.lifetime_days)
+            )
+            rotated = control.rotate_operator_access_token(
+                args.token_id,
+                overlap=timedelta(minutes=args.overlap_minutes),
+                lifetime=replacement_lifetime,
+            )
+            _write(
+                output,
+                {
+                    **_credential_document(rotated.credential),
+                    "previous_token_id": rotated.previous_token_id,
+                    "previous_valid_until": rotated.previous_valid_until.isoformat(),
+                },
+            )
+        else:  # pragma: no cover - argparse prevents this branch
+            raise AssertionError("Unhandled operator token command")
     elif args.resource == "token" and args.action == "issue":
         lifetime = None if args.lifetime_days is None else timedelta(days=args.lifetime_days)
         credential = control.issue_access_token(
@@ -711,6 +824,34 @@ def _credential_document(credential: object) -> dict[str, object]:
         "access_token": credential.access_token,
         "expires_at": credential.expires_at.isoformat(),
         "warning": "This Access Token is shown once; store it securely.",
+    }
+
+
+def _operator_document(operator: object) -> dict[str, object]:
+    from agent_memory_service.control import OperatorRecord
+
+    if not isinstance(operator, OperatorRecord):
+        raise TypeError("Expected an Operator")
+    return {
+        "operator_id": operator.operator_id,
+        "name": operator.name,
+        "roles": sorted(operator.roles),
+        "active": operator.active,
+    }
+
+
+def _operator_token_document(record: object) -> dict[str, object]:
+    from agent_memory_service.operator_auth import OperatorTokenRecord
+
+    if not isinstance(record, OperatorTokenRecord):
+        raise TypeError("Expected an Operator Access Token")
+    return {
+        "token_id": record.token_id,
+        "operator_id": record.session.operator_id,
+        "roles": sorted(record.session.roles),
+        "expires_at": record.expires_at.isoformat(),
+        "revoked_at": None if record.revoked_at is None else record.revoked_at.isoformat(),
+        "last_used_at": None if record.last_used_at is None else record.last_used_at.isoformat(),
     }
 
 

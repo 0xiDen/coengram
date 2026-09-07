@@ -1,0 +1,1670 @@
+"""HTTP Adapter for Operator admin routes."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+from pydantic import BaseModel, ConfigDict, Field
+
+from agent_memory_service.auth import AuthenticationError, RotatedCredential, TokenRecord
+from agent_memory_service.control import (
+    ControlConflict,
+    ControlModule,
+    ControlNotFound,
+    MembershipRecord,
+    OperatorRecord,
+    PrincipalRecord,
+    is_token_unused_for_30_days,
+)
+from agent_memory_service.governance import (
+    CandidateStatus,
+    KnowledgeCandidateView,
+    ReviewDecision,
+    ReviewKnowledge,
+)
+from agent_memory_service.manifest import TenantManifest
+from agent_memory_service.memory import MemoryModule
+from agent_memory_service.models import MemoryItem, PrivateMemoryInspection
+from agent_memory_service.operator_audit import OperatorAuditEventView, operator_audit_event_view
+from agent_memory_service.operator_auth import (
+    IssuedAdminSession,
+    OperatorSession,
+    OperatorTokenRecord,
+)
+from agent_memory_service.operator_provisioning import (
+    ProvisioningJobState,
+    ProvisioningJobView,
+    provisioning_job_view,
+)
+
+ADMIN_SESSION_COOKIE = "coengram_admin_session"
+ADMIN_CSRF_HEADER = "X-CoEngram-CSRF"
+ADMIN_COOKIE_MAX_AGE_SECONDS = 8 * 60 * 60
+TENANT_VISIBLE_ROLES = frozenset(
+    {
+        "tenant_provisioner",
+        "tenant_support",
+        "identity_admin",
+        "knowledge_admin",
+        "audit_viewer",
+        "operator_admin",
+    }
+)
+IDENTITY_MUTATION_ROLES = frozenset({"identity_admin", "operator_admin"})
+AUDIT_VISIBLE_ROLES = frozenset({"audit_viewer", "operator_admin"})
+PROVISIONING_MUTATION_ROLES = frozenset({"tenant_provisioner", "operator_admin"})
+PROVISIONING_VISIBLE_ROLES = frozenset(
+    {"tenant_provisioner", "tenant_support", "audit_viewer", "operator_admin"}
+)
+OPERATOR_ADMIN_ROLES = frozenset({"operator_admin"})
+OPERATOR_TOKEN_VISIBLE_ROLES = frozenset({"token_admin", "operator_admin"})
+OPERATOR_TOKEN_MUTATION_ROLES = frozenset({"token_admin", "operator_admin"})
+IDENTITY_VISIBLE_ROLES = frozenset({"identity_admin", "tenant_support", "operator_admin"})
+TOKEN_VISIBLE_ROLES = frozenset(
+    {"token_admin", "identity_admin", "tenant_support", "operator_admin"}
+)
+TOKEN_MUTATION_ROLES = frozenset({"token_admin", "identity_admin", "operator_admin"})
+KNOWLEDGE_ROLES = frozenset({"knowledge_admin", "operator_admin"})
+SUPPORT_LENS_ROLES = frozenset({"tenant_support", "knowledge_admin", "operator_admin"})
+TOKEN_EXPIRY_WARNING_WINDOW = timedelta(days=7)
+PROVISIONING_STALE_AFTER = timedelta(minutes=5)
+
+
+class AdminLoginBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    access_token: str = Field(min_length=1)
+
+
+class AdminSessionCreated(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    session_id: str
+    operator_id: str
+    roles: tuple[str, ...]
+    csrf_token: str
+    absolute_expires_at: str
+    idle_expires_at: str
+
+
+class AdminSessionView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    session_id: str
+    operator_id: str
+    roles: tuple[str, ...]
+
+
+class TenantView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    name: str
+    active: bool
+
+
+class TenantListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenants: tuple[TenantView, ...]
+
+
+class OperatorView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    operator_id: str
+    name: str
+    roles: tuple[str, ...]
+    active: bool
+
+
+class OperatorListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    operators: tuple[OperatorView, ...]
+
+
+class CreateOperatorBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    operator_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    roles: tuple[str, ...] = Field(min_length=1)
+
+
+class UpdateOperatorBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1)
+    roles: tuple[str, ...] | None = Field(default=None, min_length=1)
+    active: bool | None = None
+
+
+class PrincipalView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    principal_id: str
+    name: str
+    kind: str
+    active: bool
+
+
+class MembershipView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    principal_id: str
+    roles: tuple[str, ...]
+    active: bool
+
+
+class PrincipalListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    principals: tuple[PrincipalView, ...]
+    memberships: tuple[MembershipView, ...]
+
+
+class CredentialView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    token_id: str
+    access_token: str
+    expires_at: str
+    warning: str
+
+
+class TokenRecordView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    token_id: str
+    tenant_id: str
+    principal_id: str
+    actor_kind: str
+    roles: tuple[str, ...]
+    subject_user_id: str | None
+    delegation_id: str | None
+    issued_at: str
+    expires_at: str
+    revoked_at: str | None
+    last_used_at: str | None
+    active: bool
+
+
+class TokenListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tokens: tuple[TokenRecordView, ...]
+
+
+class OperatorTokenRecordView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    token_id: str
+    operator_id: str
+    roles: tuple[str, ...]
+    issued_at: str
+    expires_at: str
+    revoked_at: str | None
+    last_used_at: str | None
+    active: bool
+
+
+class OperatorTokenListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tokens: tuple[OperatorTokenRecordView, ...]
+
+
+class IssueOperatorTokenBody(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lifetime_days: int | None = Field(default=None, ge=1, le=30)
+
+
+class IssueTokenBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    principal_id: str = Field(min_length=1)
+    lifetime_days: int | None = Field(default=None, ge=1, le=90)
+
+
+class RotateTokenBody(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    overlap_minutes: int = Field(ge=1, le=24 * 60)
+    lifetime_days: int | None = Field(default=None, ge=1, le=90)
+
+
+class RotateOperatorTokenBody(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    overlap_minutes: int = Field(ge=1, le=24 * 60)
+    lifetime_days: int | None = Field(default=None, ge=1, le=30)
+
+
+class RotatedCredentialView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    previous_token_id: str
+    previous_valid_until: str
+    credential: CredentialView
+
+
+class CreateUserBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    tenant_id: str = Field(min_length=1)
+    principal_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    roles: tuple[str, ...] = Field(min_length=1)
+    issue_token: bool = False
+    token_lifetime_days: int | None = Field(default=None, ge=1, le=90)
+
+
+class CreatedUserView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    principal: PrincipalView
+    membership: MembershipView
+    credential: CredentialView | None = None
+
+
+class CreateProvisioningJobBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    manifest: TenantManifest
+
+
+class ProvisioningJobListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    jobs: tuple[ProvisioningJobView, ...]
+
+
+class ProvisioningPlanBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    manifest: TenantManifest
+
+
+class ProvisioningPlanView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenant_id: str
+    name: str
+    manifest_fingerprint: str
+    database_name: str
+    database_role: str
+    neo4j_service_name: str
+    existing_tenant_active: bool | None
+    cleanup_eligible: bool
+    warnings: tuple[str, ...] = ()
+
+
+class RetryProvisioningJobBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=4_000)
+
+
+class CleanupProvisioningJobBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=200)
+
+
+class AdminKnowledgeCandidateView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    claim: str
+    confidence: float
+    proposer_id: str
+    source_count: int
+    duplicate_count: int
+    conflict_count: int
+    status: CandidateStatus
+    created_at: datetime
+    reviewed_by: str | None = None
+    review_rationale: str | None = None
+
+
+class KnowledgeCandidateListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    candidates: tuple[AdminKnowledgeCandidateView, ...]
+
+
+class ReviewKnowledgeCandidateBody(BaseModel):
+    model_config = ConfigDict(frozen=True, str_strip_whitespace=True, extra="forbid")
+
+    decision: ReviewDecision
+    rationale: str = Field(min_length=1, max_length=4_000)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+
+
+class PrivateMemoryMetadataView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    memory_id: str
+    owner_principal_id: str
+    state: str
+    operation_id: str | None
+    mutation_state: str
+    kind: str | None
+    confidence: float | None
+    created_at: str
+    supersedes_id: str | None
+
+
+class PrivateMemoryMetadataListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: tuple[PrivateMemoryMetadataView, ...]
+
+
+class TenantKnowledgeItemView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    memory_id: str
+    content: str
+    kind: str
+    confidence: float
+    provenance_actor_id: str
+    provenance_source: str
+    created_at: str
+
+
+class TenantKnowledgeListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    items: tuple[TenantKnowledgeItemView, ...]
+
+
+class KnowledgeGraphNodeView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    node_id: str
+    node_type: str
+    label: str
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class KnowledgeGraphEdgeView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    source_id: str
+    target_id: str
+    label: str
+
+
+class KnowledgeGraphView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    nodes: tuple[KnowledgeGraphNodeView, ...]
+    edges: tuple[KnowledgeGraphEdgeView, ...]
+
+
+class OperatorAuditEventListView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    events: tuple[OperatorAuditEventView, ...]
+
+
+class DashboardCountsView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    tenants: int
+    active_tenants: int
+    operators: int
+    active_operators: int
+    principals: int
+    active_principals: int
+    memberships: int
+    active_memberships: int
+    pending_knowledge_candidates: int
+
+
+class DashboardTokenWarningsView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    expiring_principal_tokens: int
+    unused_principal_tokens: int
+    expiring_operator_tokens: int
+    unused_operator_tokens: int
+
+
+class DashboardView(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    counts: DashboardCountsView
+    token_warnings: DashboardTokenWarningsView
+    failed_provisioning_jobs: tuple[ProvisioningJobView, ...]
+    stalled_provisioning_jobs: tuple[ProvisioningJobView, ...]
+    recent_audit_events: tuple[OperatorAuditEventView, ...]
+
+
+def mount_admin_routes(
+    app: FastAPI,
+    control: ControlModule,
+    *,
+    memory: MemoryModule | None = None,
+) -> None:
+    """Mount Operator-admin routes onto the shared gateway app."""
+
+    @app.post(
+        "/api/v1/admin/session",
+        response_model=AdminSessionCreated,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_admin_session(
+        body: AdminLoginBody,
+        request: Request,
+        response: Response,
+    ) -> AdminSessionCreated:
+        try:
+            created = control.create_admin_session(body.access_token)
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+            ) from exc
+        _set_session_cookie(
+            response,
+            created.session_token,
+            secure=_admin_cookie_secure(request),
+        )
+        return _created_session_document(created)
+
+    @app.get("/api/v1/admin/session", response_model=AdminSessionView)
+    async def current_admin_session(request: Request) -> AdminSessionView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        return _session_view(session)
+
+    @app.get("/api/v1/admin/dashboard", response_model=DashboardView)
+    async def admin_dashboard(request: Request) -> DashboardView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(
+            session,
+            TENANT_VISIBLE_ROLES
+            | IDENTITY_VISIBLE_ROLES
+            | TOKEN_VISIBLE_ROLES
+            | PROVISIONING_VISIBLE_ROLES
+            | KNOWLEDGE_ROLES
+            | AUDIT_VISIBLE_ROLES,
+        )
+        return await _dashboard_view(control, memory)
+
+    @app.get("/api/v1/admin/tenants", response_model=TenantListView)
+    async def list_admin_tenants(request: Request) -> TenantListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, TENANT_VISIBLE_ROLES)
+        return TenantListView(
+            tenants=tuple(
+                TenantView(
+                    tenant_id=tenant.tenant_id,
+                    name=tenant.name,
+                    active=tenant.active,
+                )
+                for tenant in control.list_tenants()
+            )
+        )
+
+    @app.get("/api/v1/admin/operators", response_model=OperatorListView)
+    async def list_admin_operators(request: Request) -> OperatorListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        return OperatorListView(
+            operators=tuple(_operator_view(operator) for operator in control.list_operators())
+        )
+
+    @app.post(
+        "/api/v1/admin/operators",
+        response_model=OperatorView,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_admin_operator(
+        body: CreateOperatorBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> OperatorView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        try:
+            operator = control.create_operator(
+                body.operator_id,
+                body.name,
+                frozenset(body.roles),
+            )
+        except ControlConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="operator.create",
+            target_type="operator",
+            target_ids={"operator_id": operator.operator_id},
+            after_metadata={"roles": ",".join(sorted(operator.roles))},
+        )
+        return _operator_view(operator)
+
+    @app.patch("/api/v1/admin/operators/{operator_id}", response_model=OperatorView)
+    async def update_admin_operator(
+        operator_id: str,
+        body: UpdateOperatorBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> OperatorView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, OPERATOR_ADMIN_ROLES)
+        try:
+            operator = control.update_operator(
+                operator_id,
+                name=body.name,
+                roles=None if body.roles is None else frozenset(body.roles),
+                active=body.active,
+            )
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="operator.update",
+            target_type="operator",
+            target_ids={"operator_id": operator.operator_id},
+            after_metadata={
+                "active": str(operator.active).lower(),
+                "roles": ",".join(sorted(operator.roles)),
+            },
+        )
+        return _operator_view(operator)
+
+    @app.get(
+        "/api/v1/admin/operators/{operator_id}/tokens",
+        response_model=OperatorTokenListView,
+    )
+    async def list_admin_operator_tokens(
+        operator_id: str,
+        request: Request,
+    ) -> OperatorTokenListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_operator_token_visibility(session, operator_id)
+        try:
+            tokens = control.list_operator_tokens(operator_id)
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        return OperatorTokenListView(
+            tokens=tuple(_operator_token_record_view(token) for token in tokens)
+        )
+
+    @app.post(
+        "/api/v1/admin/operators/{operator_id}/tokens",
+        response_model=CredentialView,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def issue_admin_operator_token(
+        operator_id: str,
+        body: IssueOperatorTokenBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> CredentialView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
+        try:
+            credential = control.issue_operator_access_token(
+                operator_id,
+                lifetime=None if body.lifetime_days is None else timedelta(days=body.lifetime_days),
+            )
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="operator_token.issue",
+            target_type="operator_access_token",
+            target_ids={"operator_id": operator_id, "token_id": credential.token_id},
+        )
+        return _credential_view(credential)
+
+    @app.post(
+        "/api/v1/admin/operator-tokens/{token_id}/rotate",
+        response_model=RotatedCredentialView,
+    )
+    async def rotate_admin_operator_token(
+        token_id: str,
+        body: RotateOperatorTokenBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> RotatedCredentialView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
+        try:
+            rotated = control.rotate_operator_access_token(
+                token_id,
+                overlap=timedelta(minutes=body.overlap_minutes),
+                lifetime=None if body.lifetime_days is None else timedelta(days=body.lifetime_days),
+            )
+        except (AuthenticationError, ControlNotFound) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="operator_token.rotate",
+            target_type="operator_access_token",
+            target_ids={"token_id": token_id, "replacement_token_id": rotated.credential.token_id},
+            after_metadata={"overlap_minutes": str(body.overlap_minutes)},
+        )
+        return _rotated_credential_view(rotated)
+
+    @app.delete(
+        "/api/v1/admin/operator-tokens/{token_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def revoke_admin_operator_token(
+        token_id: str,
+        request: Request,
+        response: Response,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> Response:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, OPERATOR_TOKEN_MUTATION_ROLES)
+        control.revoke_operator_access_token(token_id)
+        control.record_operator_audit_event(
+            session,
+            action="operator_token.revoke",
+            target_type="operator_access_token",
+            target_ids={"token_id": token_id},
+        )
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
+    @app.get("/api/v1/admin/principals", response_model=PrincipalListView)
+    async def list_admin_principals(request: Request) -> PrincipalListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, IDENTITY_VISIBLE_ROLES)
+        tenants = control.list_tenants()
+        return PrincipalListView(
+            principals=tuple(_principal_view(principal) for principal in control.list_principals()),
+            memberships=tuple(
+                _membership_view(membership)
+                for tenant in tenants
+                for membership in control.list_memberships(tenant.tenant_id)
+            ),
+        )
+
+    @app.post(
+        "/api/v1/admin/users",
+        response_model=CreatedUserView,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_admin_user(
+        body: CreateUserBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> CreatedUserView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, IDENTITY_MUTATION_ROLES)
+        try:
+            principal = control.create_principal(body.principal_id, body.name, "user")
+            membership = None
+            for role in body.roles:
+                membership = control.grant_membership(body.tenant_id, body.principal_id, role)
+        except ControlConflict as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if membership is None:  # pragma: no cover - pydantic enforces at least one role
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing roles")
+        lifetime = (
+            None if body.token_lifetime_days is None else timedelta(days=body.token_lifetime_days)
+        )
+        try:
+            credential = (
+                control.issue_access_token(body.tenant_id, body.principal_id, lifetime=lifetime)
+                if body.issue_token
+                else None
+            )
+        except (ControlNotFound, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="principal.create_user",
+            target_type="principal",
+            target_ids={
+                "tenant_id": body.tenant_id,
+                "principal_id": body.principal_id,
+            },
+            after_metadata={
+                "roles": ",".join(sorted(membership.roles)),
+                "issued_token": str(credential is not None).lower(),
+            },
+        )
+        return CreatedUserView(
+            principal=_principal_view(principal),
+            membership=_membership_view(membership),
+            credential=None if credential is None else _credential_view(credential),
+        )
+
+    @app.get("/api/v1/admin/tokens", response_model=TokenListView)
+    async def list_admin_tokens(
+        tenant_id: str,
+        principal_id: str,
+        request: Request,
+    ) -> TokenListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, TOKEN_VISIBLE_ROLES)
+        return TokenListView(
+            tokens=tuple(
+                _token_record_view(token) for token in control.list_tokens(tenant_id, principal_id)
+            )
+        )
+
+    @app.post(
+        "/api/v1/admin/tokens",
+        response_model=CredentialView,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def issue_admin_token(
+        body: IssueTokenBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> CredentialView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, TOKEN_MUTATION_ROLES)
+        try:
+            credential = control.issue_access_token(
+                body.tenant_id,
+                body.principal_id,
+                lifetime=None if body.lifetime_days is None else timedelta(days=body.lifetime_days),
+            )
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="access_token.issue",
+            target_type="access_token",
+            target_ids={
+                "tenant_id": body.tenant_id,
+                "principal_id": body.principal_id,
+                "token_id": credential.token_id,
+            },
+        )
+        return _credential_view(credential)
+
+    @app.post("/api/v1/admin/tokens/{token_id}/rotate", response_model=RotatedCredentialView)
+    async def rotate_admin_token(
+        token_id: str,
+        body: RotateTokenBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> RotatedCredentialView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, TOKEN_MUTATION_ROLES)
+        try:
+            rotated = control.rotate_access_token(
+                token_id,
+                overlap=timedelta(minutes=body.overlap_minutes),
+                lifetime=None if body.lifetime_days is None else timedelta(days=body.lifetime_days),
+            )
+        except (AuthenticationError, ControlNotFound) as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        control.record_operator_audit_event(
+            session,
+            action="access_token.rotate",
+            target_type="access_token",
+            target_ids={"token_id": token_id, "replacement_token_id": rotated.credential.token_id},
+            after_metadata={"overlap_minutes": str(body.overlap_minutes)},
+        )
+        return _rotated_credential_view(rotated)
+
+    @app.delete("/api/v1/admin/tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+    async def revoke_admin_token(
+        token_id: str,
+        request: Request,
+        response: Response,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> Response:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, TOKEN_MUTATION_ROLES)
+        control.revoke_access_token(token_id)
+        control.record_operator_audit_event(
+            session,
+            action="access_token.revoke",
+            target_type="access_token",
+            target_ids={"token_id": token_id},
+        )
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-candidates",
+        response_model=KnowledgeCandidateListView,
+    )
+    async def list_admin_knowledge_candidates(
+        tenant_id: str,
+        request: Request,
+    ) -> KnowledgeCandidateListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, KNOWLEDGE_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidates = await module.list_operator_knowledge_candidates(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        return KnowledgeCandidateListView(
+            candidates=tuple(_admin_knowledge_candidate_view(candidate) for candidate in candidates)
+        )
+
+    @app.post(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-candidates/{candidate_id}/reviews",
+        response_model=AdminKnowledgeCandidateView,
+    )
+    async def review_admin_knowledge_candidate(
+        tenant_id: str,
+        candidate_id: str,
+        body: ReviewKnowledgeCandidateBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> AdminKnowledgeCandidateView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, KNOWLEDGE_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidate = await module.review_operator_knowledge(
+                tenant_id,
+                session.operator_id,
+                ReviewKnowledge(candidate_id=candidate_id, **body.model_dump()),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="knowledge_candidate.review",
+            target_type="knowledge_candidate",
+            target_ids={"tenant_id": tenant_id, "candidate_id": candidate_id},
+            after_metadata={
+                "decision": body.decision.value,
+                "status": candidate.status.value,
+            },
+        )
+        return _admin_knowledge_candidate_view(candidate)
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/memory/private",
+        response_model=PrivateMemoryMetadataListView,
+    )
+    async def list_admin_private_memory_metadata(
+        tenant_id: str,
+        principal_id: str,
+        request: Request,
+    ) -> PrivateMemoryMetadataListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            items = await module.list_operator_private_memory_metadata(tenant_id, principal_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.private_memory_metadata.view",
+            target_type="private_memory",
+            target_ids={"tenant_id": tenant_id, "principal_id": principal_id},
+            after_metadata={"item_count": str(len(items))},
+        )
+        return PrivateMemoryMetadataListView(
+            items=tuple(_private_memory_metadata_view(item) for item in items)
+        )
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/memory/tenant-knowledge",
+        response_model=TenantKnowledgeListView,
+    )
+    async def list_admin_tenant_knowledge(
+        tenant_id: str,
+        request: Request,
+    ) -> TenantKnowledgeListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            items = await module.list_operator_tenant_knowledge(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.tenant_knowledge.view",
+            target_type="tenant_knowledge",
+            target_ids={"tenant_id": tenant_id},
+            after_metadata={"item_count": str(len(items))},
+        )
+        return TenantKnowledgeListView(
+            items=tuple(_tenant_knowledge_item_view(item) for item in items)
+        )
+
+    @app.get(
+        "/api/v1/admin/tenants/{tenant_id}/knowledge-graph",
+        response_model=KnowledgeGraphView,
+    )
+    async def inspect_admin_knowledge_graph(
+        tenant_id: str,
+        request: Request,
+    ) -> KnowledgeGraphView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, SUPPORT_LENS_ROLES)
+        _require_tenant(control, tenant_id)
+        module = _require_memory(memory)
+        try:
+            candidates = await module.list_operator_knowledge_candidates(tenant_id)
+            knowledge_items = await module.list_operator_tenant_knowledge(tenant_id)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        graph = _knowledge_graph_view(tenant_id, candidates, knowledge_items)
+        control.record_operator_audit_event(
+            session,
+            action="support_lens.knowledge_graph.view",
+            target_type="knowledge_graph",
+            target_ids={"tenant_id": tenant_id},
+            after_metadata={
+                "node_count": str(len(graph.nodes)),
+                "edge_count": str(len(graph.edges)),
+            },
+        )
+        return graph
+
+    @app.post("/api/v1/admin/provisioning-plan", response_model=ProvisioningPlanView)
+    async def plan_admin_provisioning_job(
+        body: ProvisioningPlanBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningPlanView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        return _provisioning_plan_view(control, body.manifest)
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs",
+        response_model=ProvisioningJobView,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_admin_provisioning_job(
+        body: CreateProvisioningJobBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.create_provisioning_job(
+                session,
+                body.manifest,
+                idempotency_key=body.idempotency_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.get("/api/v1/admin/provisioning-jobs", response_model=ProvisioningJobListView)
+    async def list_admin_provisioning_jobs(request: Request) -> ProvisioningJobListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, PROVISIONING_VISIBLE_ROLES)
+        return ProvisioningJobListView(
+            jobs=tuple(provisioning_job_view(job) for job in control.list_provisioning_jobs())
+        )
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs/{job_id}/cancel",
+        response_model=ProvisioningJobView,
+    )
+    async def cancel_admin_provisioning_job(
+        job_id: str,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.cancel_provisioning_job(session, job_id)
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs/{job_id}/retry",
+        response_model=ProvisioningJobView,
+    )
+    async def retry_admin_provisioning_job(
+        job_id: str,
+        body: RetryProvisioningJobBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.retry_provisioning_job(session, job_id)
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.post(
+        "/api/v1/admin/provisioning-jobs/{job_id}/cleanup",
+        response_model=ProvisioningJobView,
+    )
+    async def request_admin_provisioning_cleanup(
+        job_id: str,
+        body: CleanupProvisioningJobBody,
+        request: Request,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> ProvisioningJobView:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        _require_roles(session, PROVISIONING_MUTATION_ROLES)
+        try:
+            job = control.request_provisioning_cleanup(
+                session,
+                job_id,
+                confirmation=body.confirmation,
+            )
+        except ControlNotFound as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return provisioning_job_view(job)
+
+    @app.get("/api/v1/admin/audit-events", response_model=OperatorAuditEventListView)
+    async def list_operator_audit_events(request: Request) -> OperatorAuditEventListView:
+        session = _authenticate_request(control, request, require_csrf=False)
+        _require_roles(session, AUDIT_VISIBLE_ROLES)
+        return OperatorAuditEventListView(
+            events=tuple(
+                operator_audit_event_view(event)
+                for event in control.list_operator_audit_events(limit=100)
+            )
+        )
+
+    @app.delete("/api/v1/admin/session", status_code=status.HTTP_204_NO_CONTENT)
+    async def delete_admin_session(
+        request: Request,
+        response: Response,
+        csrf_token: Annotated[str | None, Header(alias=ADMIN_CSRF_HEADER)] = None,
+    ) -> Response:
+        session = _authenticate_request(
+            control,
+            request,
+            csrf_token=csrf_token,
+            require_csrf=True,
+        )
+        if session.session_id is not None:
+            control.revoke_admin_session(session.session_id)
+        response.delete_cookie(ADMIN_SESSION_COOKIE, path="/api/v1/admin")
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
+
+def _authenticate_request(
+    control: ControlModule,
+    request: Request,
+    *,
+    csrf_token: str | None = None,
+    require_csrf: bool,
+) -> OperatorSession:
+    session_token = request.cookies.get(ADMIN_SESSION_COOKIE)
+    if not session_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    try:
+        return control.authenticate_admin_session(
+            session_token,
+            csrf_token=csrf_token,
+            require_csrf=require_csrf,
+        )
+    except AuthenticationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        ) from exc
+
+
+def _require_memory(memory: MemoryModule | None) -> MemoryModule:
+    if memory is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant Memory is not available",
+        )
+    return memory
+
+
+async def _dashboard_view(
+    control: ControlModule,
+    memory: MemoryModule | None,
+) -> DashboardView:
+    checked_at = datetime.now(UTC)
+    tenants = control.list_tenants()
+    operators = control.list_operators()
+    principals = control.list_principals()
+    memberships = tuple(
+        membership
+        for tenant in tenants
+        for membership in control.list_memberships(tenant.tenant_id)
+    )
+    principal_tokens = tuple(
+        token
+        for membership in memberships
+        for token in control.list_tokens(membership.tenant_id, membership.principal_id)
+    )
+    operator_tokens = tuple(
+        token
+        for operator in operators
+        for token in control.list_operator_tokens(operator.operator_id)
+    )
+    jobs = control.list_provisioning_jobs()
+    pending_knowledge_candidates = 0
+    if memory is not None:
+        for tenant in tenants:
+            try:
+                candidates = await memory.list_operator_knowledge_candidates(tenant.tenant_id)
+            except RuntimeError:
+                continue
+            pending_knowledge_candidates += sum(
+                1 for candidate in candidates if candidate.status is CandidateStatus.SUBMITTED
+            )
+
+    return DashboardView(
+        counts=DashboardCountsView(
+            tenants=len(tenants),
+            active_tenants=sum(1 for tenant in tenants if tenant.active),
+            operators=len(operators),
+            active_operators=sum(1 for operator in operators if operator.active),
+            principals=len(principals),
+            active_principals=sum(1 for principal in principals if principal.active),
+            memberships=len(memberships),
+            active_memberships=sum(1 for membership in memberships if membership.active),
+            pending_knowledge_candidates=pending_knowledge_candidates,
+        ),
+        token_warnings=DashboardTokenWarningsView(
+            expiring_principal_tokens=sum(
+                1
+                for token in principal_tokens
+                if _active_principal_token(token, checked_at)
+                and token.expires_at <= checked_at + TOKEN_EXPIRY_WARNING_WINDOW
+            ),
+            unused_principal_tokens=sum(
+                1
+                for token in principal_tokens
+                if is_token_unused_for_30_days(token, now=checked_at)
+            ),
+            expiring_operator_tokens=sum(
+                1
+                for token in operator_tokens
+                if _active_operator_token(token, checked_at)
+                and token.expires_at <= checked_at + TOKEN_EXPIRY_WARNING_WINDOW
+            ),
+            unused_operator_tokens=sum(
+                1
+                for token in operator_tokens
+                if _operator_token_unused_for_30_days(token, now=checked_at)
+            ),
+        ),
+        failed_provisioning_jobs=tuple(
+            provisioning_job_view(job) for job in jobs if job.state is ProvisioningJobState.FAILED
+        ),
+        stalled_provisioning_jobs=tuple(
+            provisioning_job_view(job)
+            for job in jobs
+            if job.state is ProvisioningJobState.RUNNING
+            and (
+                job.heartbeat_at is None
+                or job.heartbeat_at <= checked_at - PROVISIONING_STALE_AFTER
+            )
+        ),
+        recent_audit_events=tuple(
+            operator_audit_event_view(event)
+            for event in control.list_operator_audit_events(limit=8)
+        ),
+    )
+
+
+def _active_principal_token(record: TokenRecord, checked_at: datetime) -> bool:
+    return record.revoked_at is None and record.expires_at > checked_at
+
+
+def _active_operator_token(record: OperatorTokenRecord, checked_at: datetime) -> bool:
+    return record.revoked_at is None and record.expires_at > checked_at
+
+
+def _operator_token_unused_for_30_days(
+    record: OperatorTokenRecord,
+    *,
+    now: datetime,
+) -> bool:
+    if now.tzinfo is None:
+        raise ValueError("Token inventory time must be timezone-aware")
+    last_activity = record.last_used_at or record.issued_at
+    return _active_operator_token(record, now) and last_activity <= now - timedelta(days=30)
+
+
+def _provisioning_plan_view(
+    control: ControlModule,
+    manifest: TenantManifest,
+) -> ProvisioningPlanView:
+    existing_tenant = next(
+        (tenant for tenant in control.list_tenants() if tenant.tenant_id == manifest.tenant_id),
+        None,
+    )
+    warnings: list[str] = []
+    if existing_tenant is not None and existing_tenant.active:
+        warnings.append("Active Tenant already exists; cleanup is not available.")
+    elif existing_tenant is not None:
+        warnings.append("Inactive Tenant record exists; verify cleanup before retrying.")
+    return ProvisioningPlanView(
+        tenant_id=manifest.tenant_id,
+        name=manifest.name,
+        manifest_fingerprint=manifest.fingerprint,
+        database_name=manifest.database_name,
+        database_role=manifest.database_role,
+        neo4j_service_name=manifest.neo4j_service_name,
+        existing_tenant_active=None if existing_tenant is None else existing_tenant.active,
+        cleanup_eligible=existing_tenant is None or not existing_tenant.active,
+        warnings=tuple(warnings),
+    )
+
+
+def _admin_cookie_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    first_forwarded_proto = forwarded_proto.split(",", 1)[0].strip().lower()
+    return request.url.scheme == "https" or first_forwarded_proto == "https"
+
+
+def _set_session_cookie(response: Response, session_token: str, *, secure: bool) -> None:
+    response.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        session_token,
+        max_age=ADMIN_COOKIE_MAX_AGE_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="strict",
+        path="/api/v1/admin",
+    )
+
+
+def _created_session_document(created: IssuedAdminSession) -> AdminSessionCreated:
+    return AdminSessionCreated(
+        session_id=created.session_id,
+        operator_id=created.session.operator_id,
+        roles=tuple(sorted(created.session.roles)),
+        csrf_token=created.csrf_token,
+        absolute_expires_at=created.absolute_expires_at.isoformat(),
+        idle_expires_at=created.idle_expires_at.isoformat(),
+    )
+
+
+def _session_view(session: OperatorSession) -> AdminSessionView:
+    if session.session_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    return AdminSessionView(
+        session_id=session.session_id,
+        operator_id=session.operator_id,
+        roles=tuple(sorted(session.roles)),
+    )
+
+
+def _operator_view(operator: OperatorRecord) -> OperatorView:
+    return OperatorView(
+        operator_id=operator.operator_id,
+        name=operator.name,
+        roles=tuple(sorted(operator.roles)),
+        active=operator.active,
+    )
+
+
+def _principal_view(principal: PrincipalRecord) -> PrincipalView:
+    return PrincipalView(
+        principal_id=principal.principal_id,
+        name=principal.name,
+        kind=principal.kind.value,
+        active=principal.active,
+    )
+
+
+def _membership_view(membership: MembershipRecord) -> MembershipView:
+    return MembershipView(
+        tenant_id=membership.tenant_id,
+        principal_id=membership.principal_id,
+        roles=tuple(sorted(membership.roles)),
+        active=membership.active,
+    )
+
+
+def _admin_knowledge_candidate_view(
+    candidate: KnowledgeCandidateView,
+) -> AdminKnowledgeCandidateView:
+    return AdminKnowledgeCandidateView(
+        id=candidate.id,
+        claim=candidate.claim,
+        confidence=candidate.confidence,
+        proposer_id=candidate.proposer_id,
+        source_count=candidate.source_count,
+        duplicate_count=len(candidate.duplicate_memory_ids),
+        conflict_count=len(candidate.conflicting_memory_ids),
+        status=candidate.status,
+        created_at=candidate.created_at,
+        reviewed_by=candidate.reviewed_by,
+        review_rationale=candidate.review_rationale,
+    )
+
+
+def _private_memory_metadata_view(item: PrivateMemoryInspection) -> PrivateMemoryMetadataView:
+    return PrivateMemoryMetadataView(
+        memory_id=item.id,
+        owner_principal_id=item.owner_principal_id,
+        state=item.state.value,
+        operation_id=item.operation_id,
+        mutation_state=item.mutation_state.value,
+        kind=None if item.kind is None else item.kind.value,
+        confidence=item.confidence,
+        created_at=item.created_at.isoformat(),
+        supersedes_id=item.supersedes_id,
+    )
+
+
+def _tenant_knowledge_item_view(item: MemoryItem) -> TenantKnowledgeItemView:
+    return TenantKnowledgeItemView(
+        memory_id=item.id,
+        content=item.content,
+        kind=item.kind.value,
+        confidence=item.confidence,
+        provenance_actor_id=item.provenance.actor_id,
+        provenance_source=item.provenance.source,
+        created_at=item.created_at.isoformat(),
+    )
+
+
+def _knowledge_graph_view(
+    tenant_id: str,
+    candidates: tuple[KnowledgeCandidateView, ...],
+    knowledge_items: tuple[MemoryItem, ...],
+) -> KnowledgeGraphView:
+    nodes: dict[str, KnowledgeGraphNodeView] = {
+        f"tenant:{tenant_id}": KnowledgeGraphNodeView(
+            node_id=f"tenant:{tenant_id}",
+            node_type="tenant",
+            label=tenant_id,
+        )
+    }
+    edges: list[KnowledgeGraphEdgeView] = []
+
+    def add_actor(actor_id: str) -> str:
+        if actor_id.startswith("operator:"):
+            node_type = "operator"
+            node_id = actor_id
+        else:
+            node_type = "principal"
+            node_id = f"principal:{actor_id}"
+        nodes.setdefault(
+            node_id,
+            KnowledgeGraphNodeView(
+                node_id=node_id,
+                node_type=node_type,
+                label=actor_id,
+            ),
+        )
+        return node_id
+
+    for candidate in candidates:
+        candidate_node_id = f"candidate:{candidate.id}"
+        nodes[candidate_node_id] = KnowledgeGraphNodeView(
+            node_id=candidate_node_id,
+            node_type="candidate",
+            label=candidate.claim,
+            metadata={
+                "status": candidate.status.value,
+                "confidence": str(candidate.confidence),
+                "source_count": str(candidate.source_count),
+            },
+        )
+        proposer_node_id = add_actor(candidate.proposer_id)
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=proposer_node_id,
+                target_id=candidate_node_id,
+                label="proposed",
+            )
+        )
+        if candidate.reviewed_by is not None:
+            reviewer_node_id = add_actor(candidate.reviewed_by)
+            edges.append(
+                KnowledgeGraphEdgeView(
+                    source_id=reviewer_node_id,
+                    target_id=candidate_node_id,
+                    label="reviewed",
+                )
+            )
+
+    for item in knowledge_items:
+        knowledge_node_id = f"knowledge:{item.id}"
+        nodes[knowledge_node_id] = KnowledgeGraphNodeView(
+            node_id=knowledge_node_id,
+            node_type="tenant_knowledge",
+            label=item.content,
+            metadata={
+                "kind": item.kind.value,
+                "confidence": str(item.confidence),
+                "source": item.provenance.source,
+            },
+        )
+        actor_node_id = add_actor(item.provenance.actor_id)
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=actor_node_id,
+                target_id=knowledge_node_id,
+                label="attributed",
+            )
+        )
+        source = item.provenance.source
+        if source.startswith("candidate:"):
+            source_candidate_id = source.removeprefix("candidate:")
+            source_node_id = f"candidate:{source_candidate_id}"
+            if source_node_id in nodes:
+                edges.append(
+                    KnowledgeGraphEdgeView(
+                        source_id=source_node_id,
+                        target_id=knowledge_node_id,
+                        label="published",
+                    )
+                )
+                continue
+        edges.append(
+            KnowledgeGraphEdgeView(
+                source_id=f"tenant:{tenant_id}",
+                target_id=knowledge_node_id,
+                label="contains",
+            )
+        )
+
+    return KnowledgeGraphView(
+        nodes=tuple(sorted(nodes.values(), key=lambda node: node.node_id)),
+        edges=tuple(edges),
+    )
+
+
+def _token_record_view(record: TokenRecord) -> TokenRecordView:
+    checked_at = datetime.now(UTC)
+    return TokenRecordView(
+        token_id=record.token_id,
+        tenant_id=record.session.tenant_id,
+        principal_id=record.session.actor_id,
+        actor_kind=record.session.actor_kind.value,
+        roles=tuple(sorted(record.session.roles)),
+        subject_user_id=record.session.subject_user_id,
+        delegation_id=record.session.delegation_id,
+        issued_at=record.issued_at.isoformat(),
+        expires_at=record.expires_at.isoformat(),
+        revoked_at=None if record.revoked_at is None else record.revoked_at.isoformat(),
+        last_used_at=None if record.last_used_at is None else record.last_used_at.isoformat(),
+        active=record.revoked_at is None and record.expires_at > checked_at,
+    )
+
+
+def _operator_token_record_view(record: OperatorTokenRecord) -> OperatorTokenRecordView:
+    checked_at = datetime.now(UTC)
+    return OperatorTokenRecordView(
+        token_id=record.token_id,
+        operator_id=record.session.operator_id,
+        roles=tuple(sorted(record.session.roles)),
+        issued_at=record.issued_at.isoformat(),
+        expires_at=record.expires_at.isoformat(),
+        revoked_at=None if record.revoked_at is None else record.revoked_at.isoformat(),
+        last_used_at=None if record.last_used_at is None else record.last_used_at.isoformat(),
+        active=record.revoked_at is None and record.expires_at > checked_at,
+    )
+
+
+def _require_roles(session: OperatorSession, allowed: frozenset[str]) -> None:
+    if not session.roles.intersection(allowed):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
+def _require_operator_token_visibility(session: OperatorSession, operator_id: str) -> None:
+    if session.operator_id == operator_id:
+        return
+    _require_roles(session, OPERATOR_TOKEN_VISIBLE_ROLES)
+
+
+def _require_tenant(control: ControlModule, tenant_id: str) -> None:
+    if not any(tenant.tenant_id == tenant_id for tenant in control.list_tenants()):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+
+
+def _credential_view(credential: object) -> CredentialView:
+    from agent_memory_service.auth import IssuedCredential
+
+    if not isinstance(credential, IssuedCredential):
+        raise TypeError("Expected an issued credential")
+    return CredentialView(
+        token_id=credential.token_id,
+        access_token=credential.access_token,
+        expires_at=credential.expires_at.isoformat(),
+        warning="This Access Token is shown once; store it securely.",
+    )
+
+
+def _rotated_credential_view(rotated: RotatedCredential) -> RotatedCredentialView:
+    return RotatedCredentialView(
+        previous_token_id=rotated.previous_token_id,
+        previous_valid_until=rotated.previous_valid_until.isoformat(),
+        credential=_credential_view(rotated.credential),
+    )

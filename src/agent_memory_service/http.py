@@ -8,9 +8,11 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Response, sta
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict
 
+from agent_memory_service.admin_http import mount_admin_routes
 from agent_memory_service.agents import AgentInvocation, AgentRuntimeModule, AgentRunView
 from agent_memory_service.auth import AuthenticationError, TokenService
 from agent_memory_service.body_limits import RequestBodyLimitMiddleware
+from agent_memory_service.control import ControlModule
 from agent_memory_service.governance import (
     KnowledgeCandidateView,
     ProposeKnowledge,
@@ -80,6 +82,7 @@ def create_http_app(
     agents: AgentRuntimeModule | None = None,
     telemetry: SafeTelemetry | None = None,
     execute_agent_runs: bool = True,
+    control: ControlModule | None = None,
 ) -> FastAPI:
     """Create an application whose routes share one authentication and memory seam."""
 
@@ -156,6 +159,9 @@ def create_http_app(
                 content=telemetry.render_metrics(),
                 media_type="text/plain; version=0.0.4",
             )
+
+    if control is not None:
+        mount_admin_routes(app, control, memory=memory)
 
     @app.post(
         "/api/v1/memories",

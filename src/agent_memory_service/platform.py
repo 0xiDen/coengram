@@ -176,6 +176,7 @@ def create_gateway_app(config: PlatformConfig) -> FastAPI:
         agents=agents,
         telemetry=telemetry,
         execute_agent_runs=False,
+        control=control,
     )
     mcp_app = create_memory_mcp_server(
         memory,
