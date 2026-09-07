@@ -28,10 +28,13 @@ ALLOWED_HOSTS = frozenset(
         "huggingface.co",
         "img.shields.io",
         "neo4j.com",
+        "opencollective.com",
+        "registry.npmjs.org",
         "proton.me",
         "pypi.org",
         "quay.io",
         "raw.githubusercontent.com",
+        "tidelift.com",
         "www.w3.org",
     }
 )
