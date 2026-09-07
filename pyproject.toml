@@ -37,7 +37,7 @@ dependencies = [
   "activegraph[postgres]==1.10.0",
   "aio-pika==9.6.2",
   "alembic==1.18.5",
-  "fastapi==0.135.1",
+  "fastapi==0.141.1",
   "httpx==0.28.1",
   "langchain-anthropic==1.5.3",
   "langchain-core==1.5.3",
