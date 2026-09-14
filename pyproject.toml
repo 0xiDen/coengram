@@ -70,7 +70,7 @@ Repository = "https://github.com/0xiDen/coengram"
 [project.optional-dependencies]
 dev = [
   "build==1.5.0",
-  "mypy==1.17.1",
+  "mypy==2.3.1",
   "pytest==9.1.1",
   "pytest-asyncio==1.3.0",
   "ruff==0.16.1",
